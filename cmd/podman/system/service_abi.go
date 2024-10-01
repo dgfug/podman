@@ -1,20 +1,20 @@
-// +build linux,!remote
+//go:build (linux || freebsd) && !remote
 
 package system
 
 import (
-	"context"
+	"errors"
+	"fmt"
 	"net"
 	"net/url"
 	"os"
 	"path/filepath"
 
-	api "github.com/containers/podman/v3/pkg/api/server"
-	"github.com/containers/podman/v3/pkg/domain/entities"
-	"github.com/containers/podman/v3/pkg/domain/infra"
-	"github.com/containers/podman/v3/pkg/servicereaper"
-	"github.com/containers/podman/v3/pkg/util"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	api "github.com/containers/podman/v5/pkg/api/server"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/infra"
+	"github.com/coreos/go-systemd/v22/activation"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 	"golang.org/x/sys/unix"
@@ -22,14 +22,37 @@ import (
 
 func restService(flags *pflag.FlagSet, cfg *entities.PodmanConfig, opts entities.ServiceOptions) error {
 	var (
-		listener *net.Listener
+		listener net.Listener
 		err      error
 	)
 
-	if opts.URI != "" {
+	libpodRuntime, err := infra.GetRuntime(registry.Context(), flags, cfg)
+	if err != nil {
+		return err
+	}
+
+	if opts.URI == "" {
+		if _, found := os.LookupEnv("LISTEN_PID"); !found {
+			return errors.New("no service URI provided and socket activation protocol is not active")
+		}
+
+		listeners, err := activation.Listeners()
+		if err != nil {
+			return fmt.Errorf("cannot retrieve file descriptors from systemd: %w", err)
+		}
+		if len(listeners) != 1 {
+			return fmt.Errorf("wrong number of file descriptors for socket activation protocol (%d != 1)", len(listeners))
+		}
+		listener = listeners[0]
+		// note that activation.Listeners() returns nil when it cannot listen on the fd (i.e. udp connection)
+		if listener == nil {
+			return errors.New("unexpected fd received from systemd: cannot listen on it")
+		}
+		libpodRuntime.SetRemoteURI(listeners[0].Addr().String())
+	} else {
 		uri, err := url.Parse(opts.URI)
 		if err != nil {
-			return errors.Errorf("%s is an invalid socket destination", opts.URI)
+			return fmt.Errorf("%s is an invalid socket destination", opts.URI)
 		}
 
 		switch uri.Scheme {
@@ -38,57 +61,71 @@ func restService(flags *pflag.FlagSet, cfg *entities.PodmanConfig, opts entities
 			if err != nil {
 				return err
 			}
-			util.SetSocketPath(path)
 			if os.Getenv("LISTEN_FDS") != "" {
 				// If it is activated by systemd, use the first LISTEN_FD (3)
 				// instead of opening the socket file.
 				f := os.NewFile(uintptr(3), "podman.sock")
-				l, err := net.FileListener(f)
+				listener, err = net.FileListener(f)
 				if err != nil {
 					return err
 				}
-				listener = &l
 			} else {
-				l, err := net.Listen(uri.Scheme, path)
+				listener, err = net.Listen(uri.Scheme, path)
 				if err != nil {
-					return errors.Wrapf(err, "unable to create socket")
+					return fmt.Errorf("unable to create socket: %w", err)
 				}
-				listener = &l
 			}
 		case "tcp":
+			// We want to check if the user is requesting a TCP address.
+			// If so, warn that this is insecure.
+			// Ignore errors here, the actual backend code will handle them
+			// better than we can here.
+			logrus.Warnf("Using the Podman API service with TCP sockets is not recommended, please see `podman system service` manpage for details")
+
 			host := uri.Host
 			if host == "" {
 				// For backward compatibility, support "tcp:<host>:<port>" and "tcp://<host>:<port>"
 				host = uri.Opaque
 			}
-			l, err := net.Listen(uri.Scheme, host)
+			listener, err = net.Listen(uri.Scheme, host)
 			if err != nil {
-				return errors.Wrapf(err, "unable to create socket %v", host)
+				return fmt.Errorf("unable to create socket %v: %w", host, err)
 			}
-			listener = &l
 		default:
-			logrus.Debugf("Attempting API Service endpoint scheme %q", uri.Scheme)
+			return fmt.Errorf("API Service endpoint scheme %q is not supported. Try tcp://%s or unix://%s", uri.Scheme, opts.URI, opts.URI)
+		}
+		libpodRuntime.SetRemoteURI(uri.String())
+	}
+
+	// bugzilla.redhat.com/show_bug.cgi?id=2180483:
+	//
+	// Disable leaking the LISTEN_* into containers which
+	// are observed to be passed by systemd even without
+	// being socket activated as described in
+	// https://access.redhat.com/solutions/6512011.
+	for _, val := range []string{"LISTEN_FDS", "LISTEN_PID", "LISTEN_FDNAMES"} {
+		if err := os.Unsetenv(val); err != nil {
+			return fmt.Errorf("unsetting %s: %v", val, err)
 		}
 	}
 
-	// Close stdin, so shortnames will not prompt
+	// Set stdin to /dev/null, so shortnames will not prompt
 	devNullfile, err := os.Open(os.DevNull)
 	if err != nil {
 		return err
 	}
-	defer devNullfile.Close()
 	if err := unix.Dup2(int(devNullfile.Fd()), int(os.Stdin.Fd())); err != nil {
+		devNullfile.Close()
 		return err
 	}
-	rt, err := infra.GetRuntime(context.Background(), flags, cfg)
-	if err != nil {
-		return err
-	}
+	// Close the fd right away to not leak it during the entire time of the service.
+	devNullfile.Close()
 
-	servicereaper.Start()
+	maybeMoveToSubCgroup()
 
-	infra.StartWatcher(rt)
-	server, err := api.NewServerWithSettings(rt, listener, opts)
+	maybeStartServiceReaper()
+	infra.StartWatcher(libpodRuntime)
+	server, err := api.NewServerWithSettings(libpodRuntime, listener, opts)
 	if err != nil {
 		return err
 	}
@@ -100,7 +137,7 @@ func restService(flags *pflag.FlagSet, cfg *entities.PodmanConfig, opts entities
 
 	err = server.Serve()
 	if listener != nil {
-		_ = (*listener).Close()
+		_ = listener.Close()
 	}
 	return err
 }

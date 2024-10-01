@@ -55,9 +55,16 @@
 		{
 			"names": [
 				"bdflush",
+				"cachestat",
+				"futex_requeue",
+				"futex_wait",
+				"futex_waitv",
+				"futex_wake",
 				"io_pgetevents",
+				"io_pgetevents_time64",
 				"kexec_file_load",
 				"kexec_load",
+				"map_shadow_stack",
 				"migrate_pages",
 				"move_pages",
 				"nfsservctl",
@@ -72,9 +79,9 @@
 				"pciconfig_write",
 				"sgetmask",
 				"ssetmask",
-				"swapcontext",
 				"swapoff",
 				"swapon",
+				"syscall",
 				"sysfs",
 				"uselib",
 				"userfaultfd",
@@ -149,6 +156,7 @@
 				"fchdir",
 				"fchmod",
 				"fchmodat",
+				"fchmodat2",
 				"fchown",
 				"fchown32",
 				"fchownat",
@@ -176,6 +184,7 @@
 				"futex",
 				"futex_time64",
 				"futimesat",
+				"get_mempolicy",
 				"get_robust_list",
 				"get_thread_area",
 				"getcpu",
@@ -191,7 +200,6 @@
 				"getgroups",
 				"getgroups32",
 				"getitimer",
-				"get_mempolicy",
 				"getpeername",
 				"getpgid",
 				"getpgrp",
@@ -228,6 +236,9 @@
 				"ipc",
 				"keyctl",
 				"kill",
+				"landlock_add_rule",
+				"landlock_create_ruleset",
+				"landlock_restrict_self",
 				"lchown",
 				"lchown32",
 				"lgetxattr",
@@ -243,6 +254,7 @@
 				"lstat64",
 				"madvise",
 				"mbind",
+				"membarrier",
 				"memfd_create",
 				"memfd_secret",
 				"mincore",
@@ -256,6 +268,7 @@
 				"mmap",
 				"mmap2",
 				"mount",
+				"mount_setattr",
 				"move_mount",
 				"mprotect",
 				"mq_getsetattr",
@@ -279,9 +292,9 @@
 				"nanosleep",
 				"newfstatat",
 				"open",
+				"open_tree",
 				"openat",
 				"openat2",
-				"open_tree",
 				"pause",
 				"pidfd_getfd",
 				"pidfd_open",
@@ -300,14 +313,17 @@
 				"preadv",
 				"preadv2",
 				"prlimit64",
+				"process_mrelease",
+				"process_vm_readv",
+				"process_vm_writev",
 				"pselect6",
 				"pselect6_time64",
+				"ptrace",
 				"pwrite64",
 				"pwritev",
 				"pwritev2",
 				"read",
 				"readahead",
-				"readdir",
 				"readlink",
 				"readlinkat",
 				"readv",
@@ -360,7 +376,6 @@
 				"sendmmsg",
 				"sendmsg",
 				"sendto",
-				"setns",
 				"set_mempolicy",
 				"set_robust_list",
 				"set_thread_area",
@@ -374,6 +389,7 @@
 				"setgroups",
 				"setgroups32",
 				"setitimer",
+				"setns",
 				"setpgid",
 				"setpriority",
 				"setregid",
@@ -396,8 +412,10 @@
 				"shmget",
 				"shutdown",
 				"sigaltstack",
+				"signal",
 				"signalfd",
 				"signalfd4",
+				"sigprocmask",
 				"sigreturn",
 				"socketcall",
 				"socketpair",
@@ -545,7 +563,8 @@
 		},
 		{
 			"names": [
-				"sync_file_range2"
+				"sync_file_range2",
+				"swapcontext"
 			],
 			"action": "SCMP_ACT_ALLOW",
 			"args": [],
@@ -561,10 +580,10 @@
 			"names": [
 				"arm_fadvise64_64",
 				"arm_sync_file_range",
-				"sync_file_range2",
 				"breakpoint",
 				"cacheflush",
-				"set_tls"
+				"set_tls",
+				"sync_file_range2"
 			],
 			"action": "SCMP_ACT_ALLOW",
 			"args": [],
@@ -627,6 +646,20 @@
 		},
 		{
 			"names": [
+				"riscv_flush_icache"
+			],
+			"action": "SCMP_ACT_ALLOW",
+			"args": [],
+			"comment": "",
+			"includes": {
+				"arches": [
+					"riscv64"
+				]
+			},
+			"excludes": {}
+		},
+		{
+			"names": [
 				"open_by_handle_at"
 			],
 			"action": "SCMP_ACT_ALLOW",
@@ -660,8 +693,8 @@
 				"bpf",
 				"fanotify_init",
 				"lookup_dcookie",
-				"perf_event_open",
 				"quotactl",
+				"quotactl_fd",
 				"setdomainname",
 				"sethostname",
 				"setns"
@@ -678,11 +711,11 @@
 		},
 		{
 			"names": [
-				"bpf",
 				"fanotify_init",
 				"lookup_dcookie",
 				"perf_event_open",
 				"quotactl",
+				"quotactl_fd",
 				"setdomainname",
 				"sethostname",
 				"setns"
@@ -732,8 +765,8 @@
 		{
 			"names": [
 				"delete_module",
-				"init_module",
 				"finit_module",
+				"init_module",
 				"query_module"
 			],
 			"action": "SCMP_ACT_ALLOW",
@@ -749,8 +782,8 @@
 		{
 			"names": [
 				"delete_module",
-				"init_module",
 				"finit_module",
+				"init_module",
 				"query_module"
 			],
 			"action": "SCMP_ACT_ERRNO",
@@ -798,10 +831,7 @@
 		{
 			"names": [
 				"kcmp",
-				"process_madvise",
-				"process_vm_readv",
-				"process_vm_writev",
-				"ptrace"
+				"process_madvise"
 			],
 			"action": "SCMP_ACT_ALLOW",
 			"args": [],
@@ -816,10 +846,7 @@
 		{
 			"names": [
 				"kcmp",
-				"process_madvise",
-				"process_vm_readv",
-				"process_vm_writev",
-				"ptrace"
+				"process_madvise"
 			],
 			"action": "SCMP_ACT_ERRNO",
 			"args": [],
@@ -835,8 +862,8 @@
 		},
 		{
 			"names": [
-				"iopl",
-				"ioperm"
+				"ioperm",
+				"iopl"
 			],
 			"action": "SCMP_ACT_ALLOW",
 			"args": [],
@@ -850,8 +877,8 @@
 		},
 		{
 			"names": [
-				"iopl",
-				"ioperm"
+				"ioperm",
+				"iopl"
 			],
 			"action": "SCMP_ACT_ERRNO",
 			"args": [],
@@ -867,10 +894,10 @@
 		},
 		{
 			"names": [
-				"settimeofday",
-				"stime",
 				"clock_settime",
-				"clock_settime64"
+				"clock_settime64",
+				"settimeofday",
+				"stime"
 			],
 			"action": "SCMP_ACT_ALLOW",
 			"args": [],
@@ -884,10 +911,10 @@
 		},
 		{
 			"names": [
-				"settimeofday",
-				"stime",
 				"clock_settime",
-				"clock_settime64"
+				"clock_settime64",
+				"settimeofday",
+				"stime"
 			],
 			"action": "SCMP_ACT_ERRNO",
 			"args": [],
@@ -1033,6 +1060,68 @@
 			"includes": {
 				"caps": [
 					"CAP_AUDIT_WRITE"
+				]
+			},
+			"excludes": {}
+		},
+		{
+			"names": [
+				"bpf"
+			],
+			"action": "SCMP_ACT_ERRNO",
+			"args": [],
+			"comment": "",
+			"includes": {},
+			"excludes": {
+				"caps": [
+					"CAP_SYS_ADMIN",
+					"CAP_BPF"
+				]
+			},
+			"errnoRet": 1,
+			"errno": "EPERM"
+		},
+		{
+			"names": [
+				"bpf"
+			],
+			"action": "SCMP_ACT_ALLOW",
+			"args": [],
+			"comment": "",
+			"includes": {
+				"caps": [
+					"CAP_BPF"
+				]
+			},
+			"excludes": {}
+		},
+		{
+			"names": [
+				"perf_event_open"
+			],
+			"action": "SCMP_ACT_ERRNO",
+			"args": [],
+			"comment": "",
+			"includes": {},
+			"excludes": {
+				"caps": [
+					"CAP_SYS_ADMIN",
+					"CAP_BPF"
+				]
+			},
+			"errnoRet": 1,
+			"errno": "EPERM"
+		},
+		{
+			"names": [
+				"perf_event_open"
+			],
+			"action": "SCMP_ACT_ALLOW",
+			"args": [],
+			"comment": "",
+			"includes": {
+				"caps": [
+					"CAP_PERFMON"
 				]
 			},
 			"excludes": {}

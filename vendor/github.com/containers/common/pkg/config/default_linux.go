@@ -2,7 +2,7 @@ package config
 
 import (
 	"fmt"
-	"io/ioutil"
+	"os"
 	"strconv"
 	"strings"
 
@@ -13,10 +13,8 @@ const (
 	oldMaxSize = uint64(1048576)
 )
 
-// getDefaultRootlessNetwork returns the default rootless network configuration.
-// It is "slirp4netns" for Linux.
-func getDefaultRootlessNetwork() string {
-	return "slirp4netns"
+func getDefaultCgroupsMode() string {
+	return "enabled"
 }
 
 // getDefaultProcessLimits returns the nproc for the current process in ulimits format
@@ -27,12 +25,12 @@ func getDefaultProcessLimits() []string {
 	rlim := unix.Rlimit{Cur: oldMaxSize, Max: oldMaxSize}
 	oldrlim := rlim
 	// Attempt to set file limit and process limit to pid_max in OS
-	dat, err := ioutil.ReadFile("/proc/sys/kernel/pid_max")
+	dat, err := os.ReadFile("/proc/sys/kernel/pid_max")
 	if err == nil {
 		val := strings.TrimSuffix(string(dat), "\n")
-		max, err := strconv.ParseUint(val, 10, 64)
+		maxLimit, err := strconv.ParseUint(val, 10, 64)
 		if err == nil {
-			rlim = unix.Rlimit{Cur: uint64(max), Max: uint64(max)}
+			rlim = unix.Rlimit{Cur: maxLimit, Max: maxLimit}
 		}
 	}
 	defaultLimits := []string{}
@@ -42,4 +40,30 @@ func getDefaultProcessLimits() []string {
 		defaultLimits = append(defaultLimits, fmt.Sprintf("nproc=%d:%d", oldrlim.Cur, oldrlim.Max))
 	}
 	return defaultLimits
+}
+
+// getDefaultTmpDir for linux
+func getDefaultTmpDir() string {
+	// first check the TMPDIR env var
+	if path, found := os.LookupEnv("TMPDIR"); found {
+		return path
+	}
+	return "/var/tmp"
+}
+
+func getDefaultLockType() string {
+	return "shm"
+}
+
+func getLibpodTmpDir() string {
+	return "/run/libpod"
+}
+
+// getDefaultMachineVolumes returns default mounted volumes (possibly with env vars, which will be expanded)
+func getDefaultMachineVolumes() []string {
+	return []string{"$HOME:$HOME"}
+}
+
+func getDefaultComposeProviders() []string {
+	return defaultUnixComposeProviders
 }

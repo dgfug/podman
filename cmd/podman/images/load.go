@@ -2,21 +2,21 @@ package images
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"strings"
 
 	"github.com/containers/common/pkg/completion"
 	"github.com/containers/common/pkg/download"
-	"github.com/containers/podman/v3/cmd/podman/registry"
-	"github.com/containers/podman/v3/cmd/podman/validate"
-	"github.com/containers/podman/v3/pkg/domain/entities"
-	"github.com/containers/podman/v3/pkg/util"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/util"
+	"github.com/containers/storage/pkg/fileutils"
 	"github.com/spf13/cobra"
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 )
 
 var (
@@ -64,15 +64,17 @@ func loadFlags(cmd *cobra.Command) {
 	_ = cmd.RegisterFlagCompletionFunc(inputFlagName, completion.AutocompleteDefault)
 
 	flags.BoolVarP(&loadOpts.Quiet, "quiet", "q", false, "Suppress the output")
-	flags.StringVar(&loadOpts.SignaturePolicy, "signature-policy", "", "Pathname of signature policy file")
-	_ = flags.MarkHidden("signature-policy")
+	if !registry.IsRemote() {
+		flags.StringVar(&loadOpts.SignaturePolicy, "signature-policy", "", "Pathname of signature policy file")
+		_ = flags.MarkHidden("signature-policy")
+	}
 }
 
 func load(cmd *cobra.Command, args []string) error {
 	if len(loadOpts.Input) > 0 {
 		// Download the input file if needed.
 		if strings.HasPrefix(loadOpts.Input, "https://") || strings.HasPrefix(loadOpts.Input, "http://") {
-			tmpdir, err := util.DefaultContainerConfig().ImageCopyTmpDir()
+			tmpdir, err := registry.PodmanConfig().ContainersConfDefaultsRO.ImageCopyTmpDir()
 			if err != nil {
 				return err
 			}
@@ -84,23 +86,23 @@ func load(cmd *cobra.Command, args []string) error {
 			loadOpts.Input = tmpfile
 		}
 
-		if _, err := os.Stat(loadOpts.Input); err != nil {
+		if err := fileutils.Exists(loadOpts.Input); err != nil {
 			return err
 		}
 	} else {
-		if terminal.IsTerminal(int(os.Stdin.Fd())) {
-			return errors.Errorf("cannot read from terminal. Use command-line redirection or the --input flag.")
+		if term.IsTerminal(int(os.Stdin.Fd())) {
+			return errors.New("cannot read from terminal, use command-line redirection or the --input flag")
 		}
-		outFile, err := ioutil.TempFile(util.Tmpdir(), "podman")
+		outFile, err := os.CreateTemp(util.Tmpdir(), "podman")
 		if err != nil {
-			return errors.Errorf("error creating file %v", err)
+			return fmt.Errorf("creating file %v", err)
 		}
 		defer os.Remove(outFile.Name())
 		defer outFile.Close()
 
 		_, err = io.Copy(outFile, os.Stdin)
 		if err != nil {
-			return errors.Errorf("error copying file %v", err)
+			return fmt.Errorf("copying file %v", err)
 		}
 		loadOpts.Input = outFile.Name()
 	}
@@ -108,6 +110,6 @@ func load(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Println("Loaded image(s): " + strings.Join(response.Names, ","))
+	fmt.Println("Loaded image: " + strings.Join(response.Names, "\nLoaded image: "))
 	return nil
 }

@@ -1,4 +1,4 @@
-// +build !systemd
+//go:build !systemd
 
 package events
 

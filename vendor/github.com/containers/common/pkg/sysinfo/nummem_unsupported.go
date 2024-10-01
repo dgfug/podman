@@ -1,4 +1,4 @@
-// +build windows, osx
+//go:build (windows && ignore) || osx
 
 package sysinfo
 

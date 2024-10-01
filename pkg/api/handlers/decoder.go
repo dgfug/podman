@@ -1,13 +1,16 @@
+//go:build !remote
+
 package handlers
 
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"syscall"
 	"time"
 
-	"github.com/containers/podman/v3/libpod/define"
-	"github.com/containers/podman/v3/pkg/util"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/util"
 	"github.com/gorilla/schema"
 	"github.com/sirupsen/logrus"
 )
@@ -21,14 +24,28 @@ func NewAPIDecoder() *schema.Decoder {
 	d.RegisterConverter(map[string][]string{}, convertURLValuesString)
 	d.RegisterConverter(time.Time{}, convertTimeString)
 	d.RegisterConverter(define.ContainerStatus(0), convertContainerStatusString)
+	d.RegisterConverter(map[string]string{}, convertStringMap)
 
 	var Signal syscall.Signal
 	d.RegisterConverter(Signal, convertSignal)
 	return d
 }
 
+func NewCompatAPIDecoder() *schema.Decoder {
+	dec := NewAPIDecoder()
+
+	// mimic behaviour of github.com/docker/docker/api/server/httputils.BoolValue()
+	dec.RegisterConverter(true, func(s string) reflect.Value {
+		s = strings.ToLower(strings.TrimSpace(s))
+		return reflect.ValueOf(!(s == "" || s == "0" || s == "no" || s == "false" || s == "none"))
+	})
+
+	return dec
+}
+
 // On client:
-// 	v := map[string][]string{
+//
+//	v := map[string][]string{
 //		"dangling": {"true"},
 //	}
 //
@@ -46,6 +63,15 @@ func convertURLValuesString(query string) reflect.Value {
 	}
 
 	return reflect.ValueOf(f)
+}
+
+func convertStringMap(query string) reflect.Value {
+	res := make(map[string]string)
+	err := json.Unmarshal([]byte(query), &res)
+	if err != nil {
+		logrus.Infof("convertStringMap: Failed to Unmarshal %s: %s", query, err.Error())
+	}
+	return reflect.ValueOf(res)
 }
 
 func convertContainerStatusString(query string) reflect.Value {

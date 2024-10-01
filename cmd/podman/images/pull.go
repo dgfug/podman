@@ -1,19 +1,20 @@
 package images
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 
+	"github.com/containers/buildah/pkg/cli"
 	"github.com/containers/common/pkg/auth"
 	"github.com/containers/common/pkg/completion"
 	"github.com/containers/image/v5/types"
-	"github.com/containers/podman/v3/cmd/podman/common"
-	"github.com/containers/podman/v3/cmd/podman/registry"
-	"github.com/containers/podman/v3/cmd/podman/utils"
-	"github.com/containers/podman/v3/pkg/domain/entities"
-	"github.com/containers/podman/v3/pkg/util"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/util"
 	"github.com/spf13/cobra"
 )
 
@@ -23,6 +24,7 @@ type pullOptionsWrapper struct {
 	entities.ImagePullOptions
 	TLSVerifyCLI   bool // CLI only
 	CredentialsCLI string
+	DecryptionKeys []string
 }
 
 var (
@@ -77,7 +79,7 @@ func init() {
 func pullFlags(cmd *cobra.Command) {
 	flags := cmd.Flags()
 
-	flags.BoolVar(&pullOptions.AllTags, "all-tags", false, "All tagged images in the repository will be pulled")
+	flags.BoolVarP(&pullOptions.AllTags, "all-tags", "a", false, "All tagged images in the repository will be pulled")
 
 	credsFlagName := "creds"
 	flags.StringVar(&pullOptions.CredentialsCLI, credsFlagName, "", "`Credentials` (USERNAME:PASSWORD) to use for authenticating to a registry")
@@ -101,19 +103,34 @@ func pullFlags(cmd *cobra.Command) {
 
 	flags.Bool("disable-content-trust", false, "This is a Docker specific option and is a NOOP")
 	flags.BoolVarP(&pullOptions.Quiet, "quiet", "q", false, "Suppress output information when pulling images")
-	flags.StringVar(&pullOptions.SignaturePolicy, "signature-policy", "", "`Pathname` of signature policy file (not usually used)")
 	flags.BoolVar(&pullOptions.TLSVerifyCLI, "tls-verify", true, "Require HTTPS and verify certificates when contacting registries")
 
 	authfileFlagName := "authfile"
 	flags.StringVar(&pullOptions.Authfile, authfileFlagName, auth.GetDefaultAuthFile(), "Path of the authentication file. Use REGISTRY_AUTH_FILE environment variable to override")
 	_ = cmd.RegisterFlagCompletionFunc(authfileFlagName, completion.AutocompleteDefault)
 
-	if !registry.IsRemote() {
+	decryptionKeysFlagName := "decryption-key"
+	flags.StringArrayVar(&pullOptions.DecryptionKeys, decryptionKeysFlagName, nil, "Key needed to decrypt the image (e.g. /path/to/key.pem)")
+	_ = cmd.RegisterFlagCompletionFunc(decryptionKeysFlagName, completion.AutocompleteDefault)
+
+	retryFlagName := "retry"
+	flags.Uint(retryFlagName, registry.RetryDefault(), "number of times to retry in case of failure when performing pull")
+	_ = cmd.RegisterFlagCompletionFunc(retryFlagName, completion.AutocompleteNone)
+	retryDelayFlagName := "retry-delay"
+	flags.String(retryDelayFlagName, registry.RetryDelayDefault(), "delay between retries in case of pull failures")
+	_ = cmd.RegisterFlagCompletionFunc(retryDelayFlagName, completion.AutocompleteNone)
+
+	if registry.IsRemote() {
+		_ = flags.MarkHidden(decryptionKeysFlagName)
+	} else {
 		certDirFlagName := "cert-dir"
 		flags.StringVar(&pullOptions.CertDir, certDirFlagName, "", "`Pathname` of a directory containing TLS certificates and keys")
 		_ = cmd.RegisterFlagCompletionFunc(certDirFlagName, completion.AutocompleteDefault)
+
+		signaturePolicyFlagName := "signature-policy"
+		flags.StringVar(&pullOptions.SignaturePolicy, signaturePolicyFlagName, "", "`Pathname` of signature policy file (not usually used)")
+		_ = flags.MarkHidden(signaturePolicyFlagName)
 	}
-	_ = flags.MarkHidden("signature-policy")
 }
 
 // imagePull is implement the command for pulling images.
@@ -125,8 +142,27 @@ func imagePull(cmd *cobra.Command, args []string) error {
 	if cmd.Flags().Changed("tls-verify") {
 		pullOptions.SkipTLSVerify = types.NewOptionalBool(!pullOptions.TLSVerifyCLI)
 	}
-	if pullOptions.Authfile != "" {
-		if _, err := os.Stat(pullOptions.Authfile); err != nil {
+
+	if cmd.Flags().Changed("retry") {
+		retry, err := cmd.Flags().GetUint("retry")
+		if err != nil {
+			return err
+		}
+
+		pullOptions.Retry = &retry
+	}
+
+	if cmd.Flags().Changed("retry-delay") {
+		val, err := cmd.Flags().GetString("retry-delay")
+		if err != nil {
+			return err
+		}
+
+		pullOptions.RetryDelay = val
+	}
+
+	if cmd.Flags().Changed("authfile") {
+		if err := auth.CheckAuthFile(pullOptions.Authfile); err != nil {
 			return err
 		}
 	}
@@ -136,12 +172,16 @@ func imagePull(cmd *cobra.Command, args []string) error {
 	}
 	if platform != "" {
 		if pullOptions.Arch != "" || pullOptions.OS != "" {
-			return errors.Errorf("--platform option can not be specified with --arch or --os")
+			return errors.New("--platform option can not be specified with --arch or --os")
 		}
-		split := strings.SplitN(platform, "/", 2)
-		pullOptions.OS = split[0]
-		if len(split) > 1 {
-			pullOptions.Arch = split[1]
+
+		specs := strings.Split(platform, "/")
+		pullOptions.OS = specs[0] // may be empty
+		if len(specs) > 1 {
+			pullOptions.Arch = specs[1]
+			if len(specs) > 2 {
+				pullOptions.Variant = specs[2]
+			}
 		}
 	}
 
@@ -153,6 +193,17 @@ func imagePull(cmd *cobra.Command, args []string) error {
 		pullOptions.Username = creds.Username
 		pullOptions.Password = creds.Password
 	}
+
+	decConfig, err := cli.DecryptConfig(pullOptions.DecryptionKeys)
+	if err != nil {
+		return fmt.Errorf("unable to obtain decryption config: %w", err)
+	}
+	pullOptions.OciDecryptConfig = decConfig
+
+	if !pullOptions.Quiet {
+		pullOptions.Writer = os.Stderr
+	}
+
 	// Let's do all the remaining Yoga in the API to prevent us from
 	// scattering logic across (too) many parts of the code.
 	var errs utils.OutputErrors

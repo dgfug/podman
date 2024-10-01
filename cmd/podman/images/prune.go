@@ -7,12 +7,12 @@ import (
 	"strings"
 
 	"github.com/containers/common/pkg/completion"
-	"github.com/containers/podman/v3/cmd/podman/common"
-	"github.com/containers/podman/v3/cmd/podman/registry"
-	"github.com/containers/podman/v3/cmd/podman/utils"
-	"github.com/containers/podman/v3/cmd/podman/validate"
-	"github.com/containers/podman/v3/pkg/domain/entities"
-	"github.com/containers/podman/v3/pkg/specgenutil"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/parse"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
 )
 
@@ -46,6 +46,7 @@ func init() {
 
 	flags := pruneCmd.Flags()
 	flags.BoolVarP(&pruneOpts.All, "all", "a", false, "Remove all images not in use by containers, not just dangling ones")
+	flags.BoolVarP(&pruneOpts.BuildCache, "build-cache", "", false, "Remove persistent build cache created by --mount=type=cache")
 	flags.BoolVarP(&pruneOpts.External, "external", "", false, "Remove images even when they are used by external containers (e.g., by build containers)")
 	flags.BoolVarP(&force, "force", "f", false, "Do not prompt for confirmation")
 
@@ -66,7 +67,7 @@ func prune(cmd *cobra.Command, args []string) error {
 			return nil
 		}
 	}
-	filterMap, err := specgenutil.ParseFilters(filter)
+	filterMap, err := parse.FilterArgumentsIntoFilters(filter)
 	if err != nil {
 		return err
 	}

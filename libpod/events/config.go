@@ -2,9 +2,8 @@ package events
 
 import (
 	"context"
+	"errors"
 	"time"
-
-	"github.com/pkg/errors"
 )
 
 // EventerType ...
@@ -17,13 +16,15 @@ const (
 	Journald EventerType = iota
 	// Null is a no-op events logger. It does not read or write events.
 	Null EventerType = iota
+	// Memory indicates the event logger will hold events in memory
+	Memory EventerType = iota
 )
 
 // Event describes the attributes of a libpod event
 type Event struct {
 	// ContainerExitCode is for storing the exit code of a container which can
 	// be used for "internal" event notification
-	ContainerExitCode int `json:",omitempty"`
+	ContainerExitCode *int `json:",omitempty"`
 	// ID can be for the container, image, volume, etc
 	ID string `json:",omitempty"`
 	// Image used where applicable
@@ -38,6 +39,14 @@ type Event struct {
 	Time time.Time
 	// Type of event that occurred
 	Type Type
+	// Health status of the current container
+	HealthStatus string `json:"health_status,omitempty"`
+	// Healthcheck log of the current container
+	HealthLog string `json:"health_log,omitempty"`
+	// HealthFailingStreak log of the current container
+	HealthFailingStreak int `json:"health_failing_streak,omitempty"`
+	// Error code for certain events involving errors.
+	Error string `json:"error,omitempty"`
 
 	Details
 }
@@ -45,8 +54,12 @@ type Event struct {
 // Details describes specifics about certain events, specifically around
 // container events
 type Details struct {
-	// ID is the event ID
-	ID string
+	// ContainerInspectData includes the payload of the container's inspect
+	// data. Only set when events_container_create_inspect_data is set true
+	// in containers.conf.
+	ContainerInspectData string `json:",omitempty"`
+	// PodID is the ID of the pod associated with the container.
+	PodID string `json:",omitempty"`
 	// Attributes can be used to describe specifics about the event
 	// in the case of a container event, labels for example
 	Attributes map[string]string
@@ -55,11 +68,13 @@ type Details struct {
 // EventerOptions describe options that need to be passed to create
 // an eventer
 type EventerOptions struct {
-	// EventerType describes whether to use journald or a file
+	// EventerType describes whether to use journald, file or memory
 	EventerType string
 	// LogFilePath is the path to where the log file should reside if using
 	// the file logger
 	LogFilePath string
+	// LogFileMaxSize is the default limit used for rotating the log file
+	LogFileMaxSize uint64
 }
 
 // Eventer is the interface for journald or file event logging
@@ -94,6 +109,8 @@ type Type string
 // Status describes the actual event action (stop, start, create, kill)
 type Status string
 
+// When updating this list below please also update the shell completion list in
+// cmd/podman/common/completion.go and the StringToXXX function in events.go.
 const (
 	// Container - event is related to containers
 	Container Type = "container"
@@ -108,6 +125,8 @@ const (
 	System Type = "system"
 	// Volume - event is related to volumes
 	Volume Type = "volume"
+	// Machine - event is related to machine VM's
+	Machine Type = "machine"
 
 	// Attach ...
 	Attach Status = "attach"
@@ -133,6 +152,8 @@ const (
 	Exited Status = "died"
 	// Export ...
 	Export Status = "export"
+	// HealthStatus ...
+	HealthStatus Status = "health_status"
 	// History ...
 	History Status = "history"
 	// Import ...
@@ -155,6 +176,8 @@ const (
 	Prune Status = "prune"
 	// Pull ...
 	Pull Status = "pull"
+	// PullError is an error pulling an image
+	PullError Status = "pull-error"
 	// Push ...
 	Push Status = "push"
 	// Refresh indicates that the system refreshed the state after a
@@ -162,13 +185,17 @@ const (
 	Refresh Status = "refresh"
 	// Remove ...
 	Remove Status = "remove"
+	// Rename indicates that a container was renamed
+	Rename Status = "rename"
 	// Renumber indicates that lock numbers were reallocated at user
 	// request.
 	Renumber Status = "renumber"
-	// Restart indicates the target was restarted via an API call.
+	// Restart indicates that the target was restarted via an API call.
 	Restart Status = "restart"
 	// Restore ...
 	Restore Status = "restore"
+	// Rotate indicates that the log file was rotated
+	Rotate Status = "log-rotation"
 	// Save ...
 	Save Status = "save"
 	// Start ...
@@ -185,6 +212,8 @@ const (
 	Unpause Status = "unpause"
 	// Untag ...
 	Untag Status = "untag"
+	// Update indicates that a container's configuration has been modified.
+	Update Status = "update"
 )
 
 // EventFilter for filtering events

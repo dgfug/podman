@@ -1,43 +1,24 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 
-	. "github.com/containers/podman/v3/test/utils"
-	. "github.com/onsi/ginkgo"
+	. "github.com/containers/podman/v5/test/utils"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	. "github.com/onsi/gomega/gexec"
 )
 
 const cgroupRoot = "/sys/fs/cgroup"
 
 var _ = Describe("Podman run with --cgroup-parent", func() {
-	var (
-		tempdir    string
-		err        error
-		podmanTest *PodmanTestIntegration
-	)
 
 	BeforeEach(func() {
 		SkipIfRootlessCgroupsV1("cgroup parent is not supported in cgroups v1")
-		tempdir, err = CreateTempDirInTempDir()
-		if err != nil {
-			os.Exit(1)
-		}
-		podmanTest = PodmanTestCreate(tempdir)
-		podmanTest.Setup()
-		podmanTest.SeedImages()
-	})
-
-	AfterEach(func() {
-		podmanTest.Cleanup()
-		f := CurrentGinkgoTestDescription()
-		processTestResult(f)
-
 	})
 
 	Specify("valid --cgroup-parent using cgroupfs", func() {
@@ -47,22 +28,23 @@ var _ = Describe("Podman run with --cgroup-parent", func() {
 		cgroup := "/zzz"
 		run := podmanTest.Podman([]string{"run", "--cgroupns=host", "--cgroup-parent", cgroup, fedoraMinimal, "cat", "/proc/self/cgroup"})
 		run.WaitWithDefaultTimeout()
-		Expect(run).Should(Exit(0))
-		ok, _ := run.GrepString(cgroup)
-		Expect(ok).To(BeTrue())
+		Expect(run).Should(ExitCleanly())
+		Expect(run.OutputToString()).To(ContainSubstring(cgroup))
 	})
 
 	Specify("no --cgroup-parent", func() {
-		SkipIfRootless("FIXME This seems to be broken in rootless mode")
 		cgroup := "/libpod_parent"
 		if !Containerized() && podmanTest.CgroupManager != "cgroupfs" {
-			cgroup = "/machine.slice"
+			if isRootless() {
+				cgroup = "/user.slice"
+			} else {
+				cgroup = "/machine.slice"
+			}
 		}
 		run := podmanTest.Podman([]string{"run", "--cgroupns=host", fedoraMinimal, "cat", "/proc/self/cgroup"})
 		run.WaitWithDefaultTimeout()
-		Expect(run).Should(Exit(0))
-		ok, _ := run.GrepString(cgroup)
-		Expect(ok).To(BeTrue())
+		Expect(run).Should(ExitCleanly())
+		Expect(run.OutputToString()).To(ContainSubstring(cgroup))
 	})
 
 	Specify("always honor --cgroup-parent", func() {
@@ -76,32 +58,32 @@ var _ = Describe("Podman run with --cgroup-parent", func() {
 
 		run := podmanTest.Podman([]string{"run", "-d", "--cgroupns=host", fedoraMinimal, "sleep", "100"})
 		run.WaitWithDefaultTimeout()
-		Expect(run).Should(Exit(0))
+		Expect(run).Should(ExitCleanly())
 		cid := run.OutputToString()
 
 		exec := podmanTest.Podman([]string{"exec", cid, "cat", "/proc/1/cgroup"})
 		exec.WaitWithDefaultTimeout()
-		Expect(exec).Should(Exit(0))
+		Expect(exec).Should(ExitCleanly())
 
-		containerCgroup := strings.TrimRight(strings.Replace(exec.OutputToString(), "0::", "", -1), "\n")
+		containerCgroup := strings.TrimRight(strings.ReplaceAll(exec.OutputToString(), "0::", ""), "\n")
 
 		// Move the container process to a sub cgroup
-		content, err := ioutil.ReadFile(filepath.Join(cgroupRoot, containerCgroup, "cgroup.procs"))
-		Expect(err).To(BeNil())
-		oldSubCgroupPath := filepath.Join(filepath.Join(cgroupRoot, containerCgroup, "old-container"))
+		content, err := os.ReadFile(filepath.Join(cgroupRoot, containerCgroup, "cgroup.procs"))
+		Expect(err).ToNot(HaveOccurred())
+		oldSubCgroupPath := filepath.Join(cgroupRoot, containerCgroup, "old-container")
 		err = os.MkdirAll(oldSubCgroupPath, 0755)
-		Expect(err).To(BeNil())
-		err = ioutil.WriteFile(filepath.Join(oldSubCgroupPath, "cgroup.procs"), content, 0644)
-		Expect(err).To(BeNil())
+		Expect(err).ToNot(HaveOccurred())
+		err = os.WriteFile(filepath.Join(oldSubCgroupPath, "cgroup.procs"), content, 0644)
+		Expect(err).ToNot(HaveOccurred())
 
 		newCgroup := fmt.Sprintf("%s/new-container", containerCgroup)
 		err = os.MkdirAll(filepath.Join(cgroupRoot, newCgroup), 0755)
-		Expect(err).To(BeNil())
+		Expect(err).ToNot(HaveOccurred())
 
 		run = podmanTest.Podman([]string{"--cgroup-manager=cgroupfs", "run", "--rm", "--cgroupns=host", fmt.Sprintf("--cgroup-parent=%s", newCgroup), fedoraMinimal, "cat", "/proc/self/cgroup"})
 		run.WaitWithDefaultTimeout()
-		Expect(run).Should(Exit(0))
-		cgroupEffective := strings.TrimRight(strings.Replace(run.OutputToString(), "0::", "", -1), "\n")
+		Expect(run).Should(ExitCleanly())
+		cgroupEffective := strings.TrimRight(strings.ReplaceAll(run.OutputToString(), "0::", ""), "\n")
 
 		Expect(newCgroup).To(Equal(filepath.Dir(cgroupEffective)))
 	})
@@ -113,8 +95,7 @@ var _ = Describe("Podman run with --cgroup-parent", func() {
 		cgroup := "aaaa.slice"
 		run := podmanTest.Podman([]string{"run", "--cgroupns=host", "--cgroup-parent", cgroup, fedoraMinimal, "cat", "/proc/1/cgroup"})
 		run.WaitWithDefaultTimeout()
-		Expect(run).Should(Exit(0))
-		ok, _ := run.GrepString(cgroup)
-		Expect(ok).To(BeTrue())
+		Expect(run).Should(ExitCleanly())
+		Expect(run.OutputToString()).To(ContainSubstring(cgroup))
 	})
 })

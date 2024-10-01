@@ -1,9 +1,11 @@
+//go:build !remote
+
 package generate
 
 import (
 	"testing"
 
-	"github.com/containers/podman/v3/libpod/network/types"
+	"github.com/containers/common/libnetwork/types"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -431,7 +433,6 @@ func TestParsePortMappingWithHostPort(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := ParsePortMapping(tt.arg, tt.arg2)
 			assert.NoError(t, err, "error is not nil")
@@ -666,13 +667,12 @@ func TestParsePortMappingWithoutHostPort(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := ParsePortMapping(tt.arg, tt.arg2)
 			assert.NoError(t, err, "error is not nil")
 
 			// because we always get random host ports when it is set to 0 we cannot check that exactly
-			// check if it is not 0 and set to to 0 afterwards
+			// check if it is not 0 and set to 0 afterwards
 			for i := range got {
 				assert.Greater(t, got[i].HostPort, uint16(0), "host port is zero")
 				got[i].HostPort = 0
@@ -845,7 +845,6 @@ func TestParsePortMappingMixedHostPort(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := ParsePortMapping(tt.arg, nil)
 			assert.NoError(t, err, "error is not nil")
@@ -980,7 +979,6 @@ func TestParsePortMappingError(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := ParsePortMapping(tt.arg, nil)
 			assert.EqualError(t, err, tt.err, "error does not match")

@@ -1,4 +1,4 @@
-% podman-history(1)
+% podman-history 1
 
 ## NAME
 podman\-history - Show the history of an image
@@ -17,17 +17,28 @@ set, the time of creation and size are printed out in a human readable format.
 The **--quiet** flag displays the ID of the image only when set and the **--format**
 flag is used to print the information using the Go template provided by the user.
 
+## OPTIONS
+
+#### **--format**=*format*
+
+Alter the output for a format like 'json' or a Go template.
+
 Valid placeholders for the Go template are listed below:
 
-| **Placeholder** | **Description**                                                               |
-| --------------- | ----------------------------------------------------------------------------- |
-| .ID             | Image ID                                                                      |
-| .Created        | if --human, time elapsed since creation, otherwise time stamp of creation     |
-| .CreatedBy      | Command used to create the layer                                              |
-| .Size           | Size of layer on disk                                                         |
-| .Comment        | Comment for the layer                                                         |
+| **Placeholder**        | **Description**                                                           |
+|------------------------|---------------------------------------------------------------------------|
+| .Comment               | Comment for the layer                                                     |
+| .Created               | if --human, time elapsed since creation, otherwise time stamp of creation |
+| .CreatedAt             | Time when the image layer was created                                     |
+| .CreatedBy             | Command used to create the layer                                          |
+| .CreatedSince          | Elapsed time since the image layer was created                            |
+| .ID                    | Image ID                                                                  |
+| .Size                  | Size of layer on disk                                                     |
+| .Tags                  | Image tags                                                                |
 
-## OPTIONS
+#### **--help**, **-h**
+
+Print usage statement
 
 #### **--human**, **-H**
 
@@ -40,16 +51,10 @@ Do not truncate the output (default *false*).
 #### **--quiet**, **-q**
 
 Print the numeric IDs only (default *false*).
-#### **--format**=*format*
-
-Alter the output for a format like 'json' or a Go template.
-
-#### **--help**, **-h**
-
-Print usage statement
 
 ## EXAMPLES
 
+Show the history of the specified image:
 ```
 $ podman history debian
 ID              CREATED       CREATED BY                                      SIZE       COMMENT
@@ -57,6 +62,7 @@ b676ca55e4f2c   9 weeks ago   /bin/sh -c #(nop) CMD ["bash"]                  0 
 <missing>       9 weeks ago   /bin/sh -c #(nop) ADD file:ebba725fb97cea4...   45.14 MB
 ```
 
+Show the history of the specified image without truncating content and using raw data:
 ```
 $ podman history --no-trunc=true --human=false debian
 ID              CREATED                CREATED BY                                      SIZE       COMMENT
@@ -64,12 +70,14 @@ b676ca55e4f2c   2017-07-24T16:52:55Z   /bin/sh -c #(nop) CMD ["bash"]           
 <missing>       2017-07-24T16:52:54Z   /bin/sh -c #(nop) ADD file:ebba725fb97cea4...   45142935
 ```
 
+Show the formatted history of the specified image:
 ```
 $ podman history --format "{{.ID}} {{.Created}}" debian
 b676ca55e4f2c   9 weeks ago
 <missing>       9 weeks ago
 ```
 
+Show the history in JSON format for the specified image:
 ```
 $ podman history --format json debian
 [

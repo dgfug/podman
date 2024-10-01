@@ -4,7 +4,7 @@ package manifests
 import (
 	"net/url"
 
-	"github.com/containers/podman/v3/pkg/bindings/internal/util"
+	"github.com/containers/podman/v5/pkg/bindings/internal/util"
 )
 
 // Changed returns true if named field has been set
@@ -77,21 +77,6 @@ func (o *AddOptions) GetFeatures() []string {
 	return o.Features
 }
 
-// WithImages set field Images to given value
-func (o *AddOptions) WithImages(value []string) *AddOptions {
-	o.Images = value
-	return o
-}
-
-// GetImages returns value of field Images
-func (o *AddOptions) GetImages() []string {
-	if o.Images == nil {
-		var z []string
-		return z
-	}
-	return o.Images
-}
-
 // WithOS set field OS to given value
 func (o *AddOptions) WithOS(value string) *AddOptions {
 	o.OS = &value
@@ -122,6 +107,21 @@ func (o *AddOptions) GetOSVersion() string {
 	return *o.OSVersion
 }
 
+// WithOSFeatures set field OSFeatures to given value
+func (o *AddOptions) WithOSFeatures(value []string) *AddOptions {
+	o.OSFeatures = value
+	return o
+}
+
+// GetOSFeatures returns value of field OSFeatures
+func (o *AddOptions) GetOSFeatures() []string {
+	if o.OSFeatures == nil {
+		var z []string
+		return z
+	}
+	return o.OSFeatures
+}
+
 // WithVariant set field Variant to given value
 func (o *AddOptions) WithVariant(value string) *AddOptions {
 	o.Variant = &value
@@ -135,4 +135,79 @@ func (o *AddOptions) GetVariant() string {
 		return z
 	}
 	return *o.Variant
+}
+
+// WithImages set field Images to given value
+func (o *AddOptions) WithImages(value []string) *AddOptions {
+	o.Images = value
+	return o
+}
+
+// GetImages returns value of field Images
+func (o *AddOptions) GetImages() []string {
+	if o.Images == nil {
+		var z []string
+		return z
+	}
+	return o.Images
+}
+
+// WithAuthfile set field Authfile to given value
+func (o *AddOptions) WithAuthfile(value string) *AddOptions {
+	o.Authfile = &value
+	return o
+}
+
+// GetAuthfile returns value of field Authfile
+func (o *AddOptions) GetAuthfile() string {
+	if o.Authfile == nil {
+		var z string
+		return z
+	}
+	return *o.Authfile
+}
+
+// WithPassword set field Password to given value
+func (o *AddOptions) WithPassword(value string) *AddOptions {
+	o.Password = &value
+	return o
+}
+
+// GetPassword returns value of field Password
+func (o *AddOptions) GetPassword() string {
+	if o.Password == nil {
+		var z string
+		return z
+	}
+	return *o.Password
+}
+
+// WithUsername set field Username to given value
+func (o *AddOptions) WithUsername(value string) *AddOptions {
+	o.Username = &value
+	return o
+}
+
+// GetUsername returns value of field Username
+func (o *AddOptions) GetUsername() string {
+	if o.Username == nil {
+		var z string
+		return z
+	}
+	return *o.Username
+}
+
+// WithSkipTLSVerify set field SkipTLSVerify to given value
+func (o *AddOptions) WithSkipTLSVerify(value bool) *AddOptions {
+	o.SkipTLSVerify = &value
+	return o
+}
+
+// GetSkipTLSVerify returns value of field SkipTLSVerify
+func (o *AddOptions) GetSkipTLSVerify() bool {
+	if o.SkipTLSVerify == nil {
+		var z bool
+		return z
+	}
+	return *o.SkipTLSVerify
 }

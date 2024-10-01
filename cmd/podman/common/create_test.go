@@ -5,14 +5,14 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/containers/podman/v3/cmd/podman/common"
-	"github.com/containers/podman/v3/pkg/domain/entities"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestPodOptions(t *testing.T) {
 	entry := "/test1"
-	exampleOptions := entities.ContainerCreateOptions{CPUS: 5.5, CPUSetCPUs: "0-4", Entrypoint: &entry, Hostname: "foo", Name: "testing123", Volume: []string{"/fakeVol1", "/fakeVol2"}, Net: &entities.NetOptions{CNINetworks: []string{"FakeNetwork"}}, PID: "ns:/proc/self/ns"}
+	exampleOptions := entities.ContainerCreateOptions{CPUS: 5.5, CPUSetCPUs: "0-4", Entrypoint: &entry, Hostname: "foo", Name: "testing123", Volume: []string{"/fakeVol1", "/fakeVol2"}, Net: &entities.NetOptions{DNSSearch: []string{"search"}}, PID: "ns:/proc/self/ns"}
 
 	podOptions := entities.PodCreateOptions{}
 	err := common.ContainerToPodOptions(&exampleOptions, &podOptions)
@@ -28,8 +28,8 @@ func TestPodOptions(t *testing.T) {
 		for j := 0; j < cc.NumField(); j++ {
 			containerField := cc.FieldByIndex([]int{j})
 			containerType := reflect.TypeOf(exampleOptions).Field(j)
-			tagPod := strings.Split(string(podType.Tag.Get("json")), ",")[0]
-			tagContainer := strings.Split(string(containerType.Tag.Get("json")), ",")[0]
+			tagPod := strings.Split(podType.Tag.Get("json"), ",")[0]
+			tagContainer := strings.Split(containerType.Tag.Get("json"), ",")[0]
 			if tagPod == tagContainer && (tagPod != "" && tagContainer != "") {
 				areEqual := true
 				if containerField.Kind() == podField.Kind() {
@@ -39,11 +39,11 @@ func TestPodOptions(t *testing.T) {
 							areEqual = podField.Interface().([]string)[i] == w
 						}
 					case reflect.String:
-						areEqual = (podField.String() == containerField.String())
+						areEqual = podField.String() == containerField.String()
 					case reflect.Bool:
-						areEqual = (podField.Bool() == containerField.Bool())
+						areEqual = podField.Bool() == containerField.Bool()
 					case reflect.Ptr:
-						areEqual = (reflect.DeepEqual(podField.Elem().Interface(), containerField.Elem().Interface()))
+						areEqual = reflect.DeepEqual(podField.Elem().Interface(), containerField.Elem().Interface())
 					}
 				}
 				assert.True(t, areEqual)

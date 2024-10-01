@@ -1,14 +1,14 @@
 package system
 
 import (
+	"errors"
 	"os"
-	"os/exec"
 
 	"github.com/containers/common/pkg/completion"
-	"github.com/containers/podman/v3/cmd/podman/registry"
-	"github.com/containers/podman/v3/pkg/domain/entities"
-	"github.com/containers/podman/v3/pkg/rootless"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/rootless"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -24,7 +24,7 @@ var (
 		RunE:              unshare,
 		ValidArgsFunction: completion.AutocompleteDefault,
 		Example: `podman unshare id
-  podman unshare cat /proc/self/uid_map,
+  podman unshare cat /proc/self/uid_map
   podman unshare podman-script.sh`,
 	}
 )
@@ -47,35 +47,18 @@ func init() {
 
 func unshare(cmd *cobra.Command, args []string) error {
 	if isRootless := rootless.IsRootless(); !isRootless {
-		return errors.Errorf("please use unshare with rootless")
+		return errors.New("please use unshare with rootless")
 	}
 	// exec the specified command, if there is one
 	if len(args) < 1 {
 		// try to exec the shell, if one's set
 		shell, shellSet := os.LookupEnv("SHELL")
 		if !shellSet {
-			return errors.Errorf("no command specified and no $SHELL specified")
+			return errors.New("no command specified and no $SHELL specified")
 		}
 		args = []string{shell}
 	}
 
 	err := registry.ContainerEngine().Unshare(registry.Context(), args, unshareOptions)
-	if err != nil {
-		if exitError, ok := err.(*exec.ExitError); ok {
-			// the user command inside the unshare env has failed
-			// we set the exit code, do not return the error to the user
-			// otherwise "exit status X" will be printed
-			registry.SetExitCode(exitError.ExitCode())
-			return nil
-		}
-		// cmd.Run() can return fs.ErrNotExist, fs.ErrPermission or exec.ErrNotFound
-		// follow podman run/exec standard with the exit codes
-		if errors.Is(err, os.ErrNotExist) || errors.Is(err, exec.ErrNotFound) {
-			registry.SetExitCode(127)
-		} else if errors.Is(err, os.ErrPermission) {
-			registry.SetExitCode(126)
-		}
-		return err
-	}
-	return nil
+	return utils.HandleOSExecError(err)
 }

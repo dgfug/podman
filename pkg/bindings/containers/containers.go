@@ -2,18 +2,18 @@ package containers
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
 
-	"github.com/containers/podman/v3/libpod/define"
-	"github.com/containers/podman/v3/pkg/api/handlers"
-	"github.com/containers/podman/v3/pkg/bindings"
-	"github.com/containers/podman/v3/pkg/domain/entities"
-	"github.com/containers/podman/v3/pkg/domain/entities/reports"
-	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/api/handlers"
+	"github.com/containers/podman/v5/pkg/bindings"
+	"github.com/containers/podman/v5/pkg/domain/entities/reports"
+	"github.com/containers/podman/v5/pkg/domain/entities/types"
 )
 
 var (
@@ -25,7 +25,7 @@ var (
 // the most recent number of containers.  The pod and size booleans indicate that pod information and rootfs
 // size information should also be included.  Finally, the sync bool synchronizes the OCI runtime and
 // container state.
-func List(ctx context.Context, options *ListOptions) ([]entities.ListContainer, error) { // nolint:typecheck
+func List(ctx context.Context, options *ListOptions) ([]types.ListContainer, error) {
 	if options == nil {
 		options = new(ListOptions)
 	}
@@ -33,12 +33,12 @@ func List(ctx context.Context, options *ListOptions) ([]entities.ListContainer, 
 	if err != nil {
 		return nil, err
 	}
-	var containers []entities.ListContainer
+	var containers []types.ListContainer
 	params, err := options.ToParams()
 	if err != nil {
 		return nil, err
 	}
-	response, err := conn.DoRequest(nil, http.MethodGet, "/containers/json", params, nil)
+	response, err := conn.DoRequest(ctx, nil, http.MethodGet, "/containers/json", params, nil)
 	if err != nil {
 		return containers, err
 	}
@@ -64,7 +64,7 @@ func Prune(ctx context.Context, options *PruneOptions) ([]*reports.PruneReport, 
 	if err != nil {
 		return nil, err
 	}
-	response, err := conn.DoRequest(nil, http.MethodPost, "/containers/prune", params, nil)
+	response, err := conn.DoRequest(ctx, nil, http.MethodPost, "/containers/prune", params, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -78,25 +78,26 @@ func Prune(ctx context.Context, options *PruneOptions) ([]*reports.PruneReport, 
 // The volumes bool dictates that a container's volumes should also be removed.
 // The All option indicates that all containers should be removed
 // The Ignore option indicates that if a container did not exist, ignore the error
-func Remove(ctx context.Context, nameOrID string, options *RemoveOptions) error {
+func Remove(ctx context.Context, nameOrID string, options *RemoveOptions) ([]*reports.RmReport, error) {
 	if options == nil {
 		options = new(RemoveOptions)
 	}
+	var reports []*reports.RmReport
 	conn, err := bindings.GetClient(ctx)
 	if err != nil {
-		return err
+		return reports, err
 	}
 	params, err := options.ToParams()
 	if err != nil {
-		return err
+		return reports, err
 	}
-	response, err := conn.DoRequest(nil, http.MethodDelete, "/containers/%s", params, nil, nameOrID)
+	response, err := conn.DoRequest(ctx, nil, http.MethodDelete, "/containers/%s", params, nil, nameOrID)
 	if err != nil {
-		return err
+		return reports, err
 	}
 	defer response.Body.Close()
 
-	return response.Process(nil)
+	return reports, response.Process(&reports)
 }
 
 // Inspect returns low level information about a Container.  The nameOrID can be a container name
@@ -115,7 +116,7 @@ func Inspect(ctx context.Context, nameOrID string, options *InspectOptions) (*de
 	if err != nil {
 		return nil, err
 	}
-	response, err := conn.DoRequest(nil, http.MethodGet, "/containers/%s/json", params, nil, nameOrID)
+	response, err := conn.DoRequest(ctx, nil, http.MethodGet, "/containers/%s/json", params, nil, nameOrID)
 	if err != nil {
 		return nil, err
 	}
@@ -140,7 +141,7 @@ func Kill(ctx context.Context, nameOrID string, options *KillOptions) error {
 	if err != nil {
 		return err
 	}
-	response, err := conn.DoRequest(nil, http.MethodPost, "/containers/%s/kill", params, nil, nameOrID)
+	response, err := conn.DoRequest(ctx, nil, http.MethodPost, "/containers/%s/kill", params, nil, nameOrID)
 	if err != nil {
 		return err
 	}
@@ -160,7 +161,7 @@ func Pause(ctx context.Context, nameOrID string, options *PauseOptions) error {
 	if err != nil {
 		return err
 	}
-	response, err := conn.DoRequest(nil, http.MethodPost, "/containers/%s/pause", nil, nil, nameOrID)
+	response, err := conn.DoRequest(ctx, nil, http.MethodPost, "/containers/%s/pause", nil, nil, nameOrID)
 	if err != nil {
 		return err
 	}
@@ -184,7 +185,7 @@ func Restart(ctx context.Context, nameOrID string, options *RestartOptions) erro
 	if err != nil {
 		return err
 	}
-	response, err := conn.DoRequest(nil, http.MethodPost, "/containers/%s/restart", params, nil, nameOrID)
+	response, err := conn.DoRequest(ctx, nil, http.MethodPost, "/containers/%s/restart", params, nil, nameOrID)
 	if err != nil {
 		return err
 	}
@@ -200,7 +201,6 @@ func Start(ctx context.Context, nameOrID string, options *StartOptions) error {
 	if options == nil {
 		options = new(StartOptions)
 	}
-	logrus.Infof("Going to start container %q", nameOrID)
 	conn, err := bindings.GetClient(ctx)
 	if err != nil {
 		return err
@@ -209,7 +209,7 @@ func Start(ctx context.Context, nameOrID string, options *StartOptions) error {
 	if err != nil {
 		return err
 	}
-	response, err := conn.DoRequest(nil, http.MethodPost, "/containers/%s/start", params, nil, nameOrID)
+	response, err := conn.DoRequest(ctx, nil, http.MethodPost, "/containers/%s/start", params, nil, nameOrID)
 	if err != nil {
 		return err
 	}
@@ -218,7 +218,7 @@ func Start(ctx context.Context, nameOrID string, options *StartOptions) error {
 	return response.Process(nil)
 }
 
-func Stats(ctx context.Context, containers []string, options *StatsOptions) (chan entities.ContainerStatsReport, error) {
+func Stats(ctx context.Context, containers []string, options *StatsOptions) (chan types.ContainerStatsReport, error) {
 	if options == nil {
 		options = new(StatsOptions)
 	}
@@ -235,7 +235,7 @@ func Stats(ctx context.Context, containers []string, options *StatsOptions) (cha
 		params.Add("containers", c)
 	}
 
-	response, err := conn.DoRequest(nil, http.MethodGet, "/containers/stats", params, nil)
+	response, err := conn.DoRequest(ctx, nil, http.MethodGet, "/containers/stats", params, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -243,7 +243,7 @@ func Stats(ctx context.Context, containers []string, options *StatsOptions) (cha
 		return nil, response.Process(nil)
 	}
 
-	statsChan := make(chan entities.ContainerStatsReport)
+	statsChan := make(chan types.ContainerStatsReport)
 
 	go func() {
 		defer close(statsChan)
@@ -263,9 +263,9 @@ func Stats(ctx context.Context, containers []string, options *StatsOptions) (cha
 			// fall through and do some work
 		}
 
-		var report entities.ContainerStatsReport
+		var report types.ContainerStatsReport
 		if err := dec.Decode(&report); err != nil {
-			report = entities.ContainerStatsReport{Error: err}
+			report = types.ContainerStatsReport{Error: err}
 		}
 		statsChan <- report
 
@@ -290,10 +290,12 @@ func Top(ctx context.Context, nameOrID string, options *TopOptions) ([]string, e
 	}
 	params := url.Values{}
 	if options.Changed("Descriptors") {
-		psArgs := strings.Join(options.GetDescriptors(), ",")
-		params.Add("ps_args", psArgs)
+		psArgs := options.GetDescriptors()
+		for _, arg := range psArgs {
+			params.Add("ps_args", arg)
+		}
 	}
-	response, err := conn.DoRequest(nil, http.MethodGet, "/containers/%s/top", params, nil, nameOrID)
+	response, err := conn.DoRequest(ctx, nil, http.MethodGet, "/containers/%s/top", params, nil, nameOrID)
 	if err != nil {
 		return nil, err
 	}
@@ -326,7 +328,7 @@ func Unpause(ctx context.Context, nameOrID string, options *UnpauseOptions) erro
 	if err != nil {
 		return err
 	}
-	response, err := conn.DoRequest(nil, http.MethodPost, "/containers/%s/unpause", nil, nil, nameOrID)
+	response, err := conn.DoRequest(ctx, nil, http.MethodPost, "/containers/%s/unpause", nil, nil, nameOrID)
 	if err != nil {
 		return err
 	}
@@ -338,9 +340,11 @@ func Unpause(ctx context.Context, nameOrID string, options *UnpauseOptions) erro
 // Wait blocks until the given container reaches a condition. If not provided, the condition will
 // default to stopped.  If the condition is stopped, an exit code for the container will be provided. The
 // nameOrID can be a container name or a partial/full ID.
-func Wait(ctx context.Context, nameOrID string, options *WaitOptions) (int32, error) { // nolint
+func Wait(ctx context.Context, nameOrID string, options *WaitOptions) (int32, error) {
 	if options == nil {
 		options = new(WaitOptions)
+	} else if len(options.Condition) > 0 && len(options.Conditions) > 0 {
+		return -1, fmt.Errorf("%q field cannot be used with deprecated %q field", "Conditions", "Condition")
 	}
 	var exitCode int32
 	conn, err := bindings.GetClient(ctx)
@@ -351,7 +355,8 @@ func Wait(ctx context.Context, nameOrID string, options *WaitOptions) (int32, er
 	if err != nil {
 		return exitCode, err
 	}
-	response, err := conn.DoRequest(nil, http.MethodPost, "/containers/%s/wait", params, nil, nameOrID)
+	delete(params, "conditions") // They're called "condition"
+	response, err := conn.DoRequest(ctx, nil, http.MethodPost, "/containers/%s/wait", params, nil, nameOrID)
 	if err != nil {
 		return exitCode, err
 	}
@@ -372,7 +377,7 @@ func Exists(ctx context.Context, nameOrID string, options *ExistsOptions) (bool,
 	if err != nil {
 		return false, err
 	}
-	response, err := conn.DoRequest(nil, http.MethodGet, "/containers/%s/exists", params, nil, nameOrID)
+	response, err := conn.DoRequest(ctx, nil, http.MethodGet, "/containers/%s/exists", params, nil, nameOrID)
 	if err != nil {
 		return false, err
 	}
@@ -395,11 +400,14 @@ func Stop(ctx context.Context, nameOrID string, options *StopOptions) error {
 	if err != nil {
 		return err
 	}
-	response, err := conn.DoRequest(nil, http.MethodPost, "/containers/%s/stop", params, nil, nameOrID)
+	response, err := conn.DoRequest(ctx, nil, http.MethodPost, "/containers/%s/stop", params, nil, nameOrID)
 	if err != nil {
 		return err
 	}
 	defer response.Body.Close()
+	if options.GetIgnore() && response.StatusCode == http.StatusNotFound {
+		return nil
+	}
 
 	return response.Process(nil)
 }
@@ -416,13 +424,13 @@ func Export(ctx context.Context, nameOrID string, w io.Writer, options *ExportOp
 	if err != nil {
 		return err
 	}
-	response, err := conn.DoRequest(nil, http.MethodGet, "/containers/%s/export", params, nil, nameOrID)
+	response, err := conn.DoRequest(ctx, nil, http.MethodGet, "/containers/%s/export", params, nil, nameOrID)
 	if err != nil {
 		return err
 	}
 	defer response.Body.Close()
 
-	if response.StatusCode/100 == 2 {
+	if response.IsSuccess() {
 		_, err = io.Copy(w, response.Body)
 		return err
 	}
@@ -441,14 +449,14 @@ func ContainerInit(ctx context.Context, nameOrID string, options *InitOptions) e
 	if err != nil {
 		return err
 	}
-	response, err := conn.DoRequest(nil, http.MethodPost, "/containers/%s/init", nil, nil, nameOrID)
+	response, err := conn.DoRequest(ctx, nil, http.MethodPost, "/containers/%s/init", nil, nil, nameOrID)
 	if err != nil {
 		return err
 	}
 	defer response.Body.Close()
 
 	if response.StatusCode == http.StatusNotModified {
-		return errors.Wrapf(define.ErrCtrStateInvalid, "container %s has already been created in runtime", nameOrID)
+		return fmt.Errorf("container %s has already been created in runtime: %w", nameOrID, define.ErrCtrStateInvalid)
 	}
 	return response.Process(nil)
 }
@@ -462,7 +470,7 @@ func ShouldRestart(ctx context.Context, nameOrID string, options *ShouldRestartO
 	if err != nil {
 		return false, err
 	}
-	response, err := conn.DoRequest(nil, http.MethodPost, "/containers/%s/shouldrestart", nil, nil, nameOrID)
+	response, err := conn.DoRequest(ctx, nil, http.MethodPost, "/containers/%s/shouldrestart", nil, nil, nameOrID)
 	if err != nil {
 		return false, err
 	}

@@ -1,3 +1,5 @@
+//go:build !remote
+
 package compat
 
 import (
@@ -6,15 +8,13 @@ import (
 	goRuntime "runtime"
 	"time"
 
-	"github.com/containers/podman/v3/libpod"
-	"github.com/containers/podman/v3/libpod/define"
-	"github.com/containers/podman/v3/pkg/api/handlers/utils"
-	api "github.com/containers/podman/v3/pkg/api/types"
-	"github.com/containers/podman/v3/pkg/domain/entities"
-	"github.com/containers/podman/v3/pkg/domain/entities/types"
-	"github.com/containers/podman/v3/version"
-	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/api/handlers/utils"
+	api "github.com/containers/podman/v5/pkg/api/types"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/entities/types"
+	"github.com/containers/podman/v5/version"
 )
 
 func VersionHandler(w http.ResponseWriter, r *http.Request) {
@@ -22,13 +22,13 @@ func VersionHandler(w http.ResponseWriter, r *http.Request) {
 
 	running, err := define.GetVersion()
 	if err != nil {
-		utils.Error(w, "Something went wrong.", http.StatusInternalServerError, err)
+		utils.Error(w, http.StatusInternalServerError, err)
 		return
 	}
 
 	info, err := runtime.Info()
 	if err != nil {
-		utils.Error(w, "Something went wrong.", http.StatusInternalServerError, errors.Wrapf(err, "failed to obtain system memory info"))
+		utils.Error(w, http.StatusInternalServerError, fmt.Errorf("failed to obtain system memory info: %w", err))
 		return
 	}
 
@@ -46,27 +46,19 @@ func VersionHandler(w http.ResponseWriter, r *http.Request) {
 			"MinAPIVersion": version.APIVersion[version.Libpod][version.MinimalAPI].String(),
 			"Os":            goRuntime.GOOS,
 		},
+	}, {
+		Name:    "Conmon",
+		Version: info.Host.Conmon.Version,
+		Details: map[string]string{
+			"Package": info.Host.Conmon.Package,
+		},
+	}, {
+		Name:    fmt.Sprintf("OCI Runtime (%s)", info.Host.OCIRuntime.Name),
+		Version: info.Host.OCIRuntime.Version,
+		Details: map[string]string{
+			"Package": info.Host.OCIRuntime.Package,
+		},
 	}}
-
-	if conmon, oci, err := runtime.DefaultOCIRuntime().RuntimeInfo(); err != nil {
-		logrus.Warnf("Failed to retrieve Conmon and OCI Information: %q", err.Error())
-	} else {
-		additional := []types.ComponentVersion{
-			{
-				Name:    "Conmon",
-				Version: conmon.Version,
-				Details: map[string]string{
-					"Package": conmon.Package,
-				}},
-			{
-				Name:    fmt.Sprintf("OCI Runtime (%s)", oci.Name),
-				Version: oci.Version,
-				Details: map[string]string{
-					"Package": oci.Package,
-				}},
-		}
-		components = append(components, additional...)
-	}
 
 	apiVersion := version.APIVersion[version.Compat][version.CurrentAPI]
 	minVersion := version.APIVersion[version.Compat][version.MinimalAPI]
@@ -89,5 +81,6 @@ func VersionHandler(w http.ResponseWriter, r *http.Request) {
 			MinAPIVersion: fmt.Sprintf("%d.%d", minVersion.Major, minVersion.Minor),
 			Os:            components[0].Details["Os"],
 			Version:       components[0].Version,
-		}})
+		},
+	})
 }

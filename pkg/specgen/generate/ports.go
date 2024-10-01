@@ -1,20 +1,19 @@
+//go:build !remote
+
 package generate
 
 import (
-	"context"
 	"fmt"
 	"net"
+	"slices"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/containers/common/libimage"
-	"github.com/containers/podman/v3/libpod/network/types"
-	"github.com/containers/podman/v3/utils"
-
-	"github.com/containers/podman/v3/pkg/specgen"
-	"github.com/containers/podman/v3/pkg/util"
-	"github.com/pkg/errors"
+	"github.com/containers/common/libnetwork/types"
+	"github.com/containers/podman/v5/pkg/specgen"
+	"github.com/containers/podman/v5/pkg/specgenutil"
+	"github.com/containers/podman/v5/utils"
 	"github.com/sirupsen/logrus"
 )
 
@@ -47,7 +46,7 @@ func joinTwoPortsToRangePortIfPossible(ports *[]types.PortMapping, allHostPorts,
 		// if both host port ranges overlap and the container port range did not match
 		// we have to error because we cannot assign the same host port to more than one container port
 		if previousPort.HostPort+previousPort.Range-1 > port.HostPort {
-			return nil, errors.Errorf("conflicting port mappings for host port %d (protocol %s)", port.HostPort, port.Protocol)
+			return nil, fmt.Errorf("conflicting port mappings for host port %d (protocol %s)", port.HostPort, port.Protocol)
 		}
 	}
 	// we could not join the ports so we append the old one to the list
@@ -57,7 +56,8 @@ func joinTwoPortsToRangePortIfPossible(ports *[]types.PortMapping, allHostPorts,
 }
 
 // joinTwoContainerPortsToRangePortIfPossible will expect two ports with both no host port set,
-//  the previous port one must have a lower or equal containerPort than the current port.
+//
+//	the previous port one must have a lower or equal containerPort than the current port.
 func joinTwoContainerPortsToRangePortIfPossible(ports *[]types.PortMapping, allHostPorts, allContainerPorts, currentHostPorts *[65536]bool,
 	previousPort *types.PortMapping, port types.PortMapping) (*types.PortMapping, error) {
 	// no previous port just return the current one
@@ -96,7 +96,7 @@ func addPortToUsedPorts(ports *[]types.PortMapping, allHostPorts, allContainerPo
 }
 
 // getRandomHostPort get a random host port mapping for the given port
-// the caller has to supply a array with  he already used ports
+// the caller has to supply an array with the already used ports
 func getRandomHostPort(hostPorts *[65536]bool, port types.PortMapping) (types.PortMapping, error) {
 outer:
 	for i := 0; i < 15; i++ {
@@ -128,7 +128,7 @@ outer:
 		rangePort = fmt.Sprintf("with range %d ", port.Range)
 	}
 
-	return port, errors.Errorf("failed to find an open port to expose container port %d %son the host", port.ContainerPort, rangePort)
+	return port, fmt.Errorf("failed to find an open port to expose container port %d %son the host", port.ContainerPort, rangePort)
 }
 
 // Parse port maps to port mappings.
@@ -158,13 +158,13 @@ func ParsePortMapping(portMappings []types.PortMapping, exposePorts map[uint16][
 	// First, we need to validate the ports passed in the specgen
 	for _, port := range portMappings {
 		// First, check proto
-		protocols, err := checkProtocol(port.Protocol, true)
+		protocols, err := checkProtocol(port.Protocol)
 		if err != nil {
 			return nil, err
 		}
 		if port.HostIP != "" {
 			if ip := net.ParseIP(port.HostIP); ip == nil {
-				return nil, errors.Errorf("invalid IP address %q in port mapping", port.HostIP)
+				return nil, fmt.Errorf("invalid IP address %q in port mapping", port.HostIP)
 			}
 		}
 
@@ -175,14 +175,14 @@ func ParsePortMapping(portMappings []types.PortMapping, exposePorts map[uint16][
 		}
 		containerPort := port.ContainerPort
 		if containerPort == 0 {
-			return nil, errors.Errorf("container port number must be non-0")
+			return nil, fmt.Errorf("container port number must be non-0")
 		}
 		hostPort := port.HostPort
 		if uint32(portRange-1)+uint32(containerPort) > 65535 {
-			return nil, errors.Errorf("container port range exceeds maximum allowable port number")
+			return nil, fmt.Errorf("container port range exceeds maximum allowable port number")
 		}
 		if uint32(portRange-1)+uint32(hostPort) > 65535 {
-			return nil, errors.Errorf("host port range exceeds maximum allowable port number")
+			return nil, fmt.Errorf("host port range exceeds maximum allowable port number")
 		}
 
 		hostProtoMap, ok := portMap[port.HostIP]
@@ -206,13 +206,12 @@ func ParsePortMapping(portMappings []types.PortMapping, exposePorts map[uint16][
 	}
 
 	// we do no longer need the original port mappings
-	// set it to 0 length so we can resuse it to populate
+	// set it to 0 length so we can reuse it to populate
 	// the slice again while keeping the underlying capacity
 	portMappings = portMappings[:0]
 
 	for hostIP, protoMap := range portMap {
 		for protocol, ports := range protoMap {
-			ports := ports
 			if len(ports) == 0 {
 				continue
 			}
@@ -312,6 +311,8 @@ func ParsePortMapping(portMappings []types.PortMapping, exposePorts map[uint16][
 						return nil, err
 					}
 					portMappings = append(portMappings, p)
+					// Mark this port as used so it doesn't get re-generated
+					allPorts[p.HostPort] = true
 				} else {
 					newProtocols = append(newProtocols, protocol)
 				}
@@ -329,7 +330,7 @@ func ParsePortMapping(portMappings []types.PortMapping, exposePorts map[uint16][
 
 func appendProtocolsNoDuplicates(slice []string, protocols []string) []string {
 	for _, proto := range protocols {
-		if util.StringInSlice(proto, slice) {
+		if slices.Contains(slice, proto) {
 			continue
 		}
 		slice = append(slice, proto)
@@ -338,7 +339,7 @@ func appendProtocolsNoDuplicates(slice []string, protocols []string) []string {
 }
 
 // Make final port mappings for the container
-func createPortMappings(ctx context.Context, s *specgen.SpecGenerator, imageData *libimage.ImageData) ([]types.PortMapping, map[uint16][]string, error) {
+func createPortMappings(s *specgen.SpecGenerator, imageData *libimage.ImageData) ([]types.PortMapping, map[uint16][]string, error) {
 	expose := make(map[uint16]string)
 	var err error
 	if imageData != nil {
@@ -352,18 +353,18 @@ func createPortMappings(ctx context.Context, s *specgen.SpecGenerator, imageData
 	for _, expose := range []map[uint16]string{expose, s.Expose} {
 		for port, proto := range expose {
 			if port == 0 {
-				return nil, nil, errors.Errorf("cannot expose 0 as it is not a valid port number")
+				return nil, nil, fmt.Errorf("cannot expose 0 as it is not a valid port number")
 			}
-			protocols, err := checkProtocol(proto, false)
+			protocols, err := checkProtocol(proto)
 			if err != nil {
-				return nil, nil, errors.Wrapf(err, "error validating protocols for exposed port %d", port)
+				return nil, nil, fmt.Errorf("validating protocols for exposed port %d: %w", port, err)
 			}
 			toExpose[port] = appendProtocolsNoDuplicates(toExpose[port], protocols)
 		}
 	}
 
 	publishPorts := toExpose
-	if !s.PublishExposedPorts {
+	if s.PublishExposedPorts == nil || !*s.PublishExposedPorts {
 		publishPorts = nil
 	}
 
@@ -375,7 +376,7 @@ func createPortMappings(ctx context.Context, s *specgen.SpecGenerator, imageData
 }
 
 // Check a string to ensure it is a comma-separated set of valid protocols
-func checkProtocol(protocol string, allowSCTP bool) ([]string, error) {
+func checkProtocol(protocol string) ([]string, error) {
 	protocols := make(map[string]struct{})
 	splitProto := strings.Split(protocol, ",")
 	// Don't error on duplicates - just deduplicate
@@ -387,12 +388,9 @@ func checkProtocol(protocol string, allowSCTP bool) ([]string, error) {
 		case protoUDP:
 			protocols[protoUDP] = struct{}{}
 		case protoSCTP:
-			if !allowSCTP {
-				return nil, errors.Errorf("protocol SCTP is not allowed for exposed ports")
-			}
 			protocols[protoSCTP] = struct{}{}
 		default:
-			return nil, errors.Errorf("unrecognized protocol %q in port mapping", p)
+			return nil, fmt.Errorf("unrecognized protocol %q in port mapping", p)
 		}
 	}
 
@@ -403,38 +401,20 @@ func checkProtocol(protocol string, allowSCTP bool) ([]string, error) {
 
 	// This shouldn't be possible, but check anyways
 	if len(finalProto) == 0 {
-		return nil, errors.Errorf("no valid protocols specified for port mapping")
+		return nil, fmt.Errorf("no valid protocols specified for port mapping")
 	}
 
 	return finalProto, nil
 }
 
 func GenExposedPorts(exposedPorts map[string]struct{}) (map[uint16]string, error) {
-	expose := make(map[uint16]string, len(exposedPorts))
-	for imgExpose := range exposedPorts {
-		// Expose format is portNumber[/protocol]
-		splitExpose := strings.SplitN(imgExpose, "/", 2)
-		num, err := strconv.Atoi(splitExpose[0])
-		if err != nil {
-			return nil, errors.Wrapf(err, "unable to convert image EXPOSE statement %q to port number", imgExpose)
-		}
-		if num > 65535 || num < 1 {
-			return nil, errors.Errorf("%d from image EXPOSE statement %q is not a valid port number", num, imgExpose)
-		}
-
-		// No need to validate protocol, we'll do it later.
-		newProto := "tcp"
-		if len(splitExpose) == 2 {
-			newProto = splitExpose[1]
-		}
-
-		proto := expose[uint16(num)]
-		if len(proto) > 1 {
-			proto = proto + "," + newProto
-		} else {
-			proto = newProto
-		}
-		expose[uint16(num)] = proto
+	expose := make([]string, 0, len(exposedPorts))
+	for e := range exposedPorts {
+		expose = append(expose, e)
 	}
-	return expose, nil
+	toReturn, err := specgenutil.CreateExpose(expose)
+	if err != nil {
+		return nil, fmt.Errorf("unable to convert image EXPOSE: %w", err)
+	}
+	return toReturn, nil
 }

@@ -1,22 +1,21 @@
-package test_bindings
+package bindings_test
 
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/containers/podman/v3/libpod/define"
-	. "github.com/containers/podman/v3/pkg/bindings"
-	"github.com/containers/podman/v3/pkg/bindings/containers"
-	"github.com/containers/podman/v3/pkg/specgen"
-	"github.com/onsi/ginkgo"
-	"github.com/onsi/gomega/gexec"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/libpod/define"
+	. "github.com/containers/podman/v5/pkg/bindings"
+	"github.com/containers/podman/v5/pkg/bindings/containers"
+	"github.com/containers/podman/v5/pkg/specgen"
+	"github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	. "github.com/onsi/gomega/gexec"
 )
 
 type testImage struct {
@@ -51,7 +50,7 @@ var (
 		shortName:   "busybox",
 		tarballName: "busybox.tar",
 	}
-	CACHE_IMAGES = []testImage{alpine, busybox}
+	CACHE_IMAGES = []testImage{alpine, busybox} //nolint:revive,stylecheck
 )
 
 type bindingTest struct {
@@ -73,7 +72,7 @@ func (b *bindingTest) NewConnection() error {
 	return nil
 }
 
-func (b *bindingTest) runPodman(command []string) *gexec.Session {
+func (b *bindingTest) runPodman(command []string) *Session {
 	var cmd []string
 	podmanBinary := getPodmanBinary()
 	val, ok := os.LookupEnv("PODMAN_BINARY")
@@ -86,7 +85,7 @@ func (b *bindingTest) runPodman(command []string) *gexec.Session {
 	}
 	val, ok = os.LookupEnv("CNI_CONFIG_DIR")
 	if ok {
-		cmd = append(cmd, "--cni-config-dir", val)
+		cmd = append(cmd, "--network-config-dir", val)
 	}
 	val, ok = os.LookupEnv("CONMON")
 	if ok {
@@ -125,9 +124,9 @@ func (b *bindingTest) runPodman(command []string) *gexec.Session {
 	cmd = append(cmd, command...)
 	c := exec.Command(podmanBinary, cmd...)
 	fmt.Printf("Running: %s %s\n", podmanBinary, strings.Join(cmd, " "))
-	session, err := gexec.Start(c, ginkgo.GinkgoWriter, ginkgo.GinkgoWriter)
+	session, err := Start(c, ginkgo.GinkgoWriter, ginkgo.GinkgoWriter)
 	if err != nil {
-		panic(errors.Errorf("unable to run podman command: %q", cmd))
+		panic(fmt.Errorf("unable to run podman command: %q", cmd))
 	}
 	return session
 }
@@ -147,11 +146,11 @@ func newBindingTest() *bindingTest {
 
 // createTempDirinTempDir create a temp dir with prefix podman_test
 func createTempDirInTempDir() (string, error) {
-	return ioutil.TempDir("", "libpod_api")
+	return os.MkdirTemp("", "libpod_api")
 }
 
-func (b *bindingTest) startAPIService() *gexec.Session {
-	cmd := []string{"--log-level=debug", "--events-backend=file", "system", "service", "--timeout=0", b.sock}
+func (b *bindingTest) startAPIService() *Session {
+	cmd := []string{"--log-level=debug", "system", "service", "--timeout=0", b.sock}
 	session := b.runPodman(cmd)
 
 	sock := strings.TrimPrefix(b.sock, "unix://")
@@ -180,11 +179,13 @@ func (b *bindingTest) cleanup() {
 func (b *bindingTest) Pull(name string) {
 	p := b.runPodman([]string{"pull", name})
 	p.Wait(45)
+	Expect(p).To(Exit(0))
 }
 
 func (b *bindingTest) Save(i testImage) {
 	p := b.runPodman([]string{"save", "-o", filepath.Join(ImageCacheDir, i.tarballName), i.name})
 	p.Wait(45)
+	Expect(p).To(Exit(0))
 }
 
 func (b *bindingTest) RestoreImagesFromCache() {
@@ -195,13 +196,15 @@ func (b *bindingTest) RestoreImagesFromCache() {
 func (b *bindingTest) restoreImageFromCache(i testImage) {
 	p := b.runPodman([]string{"load", "-i", filepath.Join(ImageCacheDir, i.tarballName)})
 	p.Wait(45)
+	Expect(p).To(Exit(0))
 }
 
 // Run a container within or without a pod
 // and add or append the alpine image to it
 func (b *bindingTest) RunTopContainer(containerName *string, podName *string) (string, error) {
 	s := specgen.NewSpecGenerator(alpine.name, false)
-	s.Terminal = false
+	terminal := false
+	s.Terminal = &terminal
 	s.Command = []string{"/usr/bin/top"}
 	if containerName != nil {
 		s.Name = *containerName
@@ -211,7 +214,7 @@ func (b *bindingTest) RunTopContainer(containerName *string, podName *string) (s
 	}
 	ctr, err := containers.CreateWithSpec(b.conn, s, nil)
 	if err != nil {
-		return "", nil
+		return "", err
 	}
 	err = containers.Start(b.conn, ctr.ID, nil)
 	if err != nil {
@@ -244,32 +247,17 @@ func (b *bindingTest) PodcreateAndExpose(name *string, port *string) {
 	b.runPodman(command).Wait(45)
 }
 
-//  StringInSlice returns a boolean based on whether a given
-//  string is in a given slice
-func StringInSlice(s string, sl []string) bool {
-	for _, val := range sl {
-		if s == val {
-			return true
-		}
-	}
-	return false
-}
-
 var _ = ginkgo.SynchronizedBeforeSuite(func() []byte {
 	// make cache dir
-	if err := os.MkdirAll(ImageCacheDir, 0777); err != nil {
-		fmt.Printf("%q\n", err)
-		os.Exit(1)
-	}
+	err := os.MkdirAll(ImageCacheDir, 0777)
+	Expect(err).ToNot(HaveOccurred())
 
 	// If running localized tests, the cache dir is created and populated. if the
 	// tests are remote, this is a no-op
 	createCache()
-	path, err := ioutil.TempDir("", "libpodlock")
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
+	path, err := os.MkdirTemp("", "libpodlock")
+	Expect(err).ToNot(HaveOccurred())
+
 	return []byte(path)
 }, func(data []byte) {
 	LockTmpDir = string(data)

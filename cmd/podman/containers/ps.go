@@ -1,22 +1,24 @@
 package containers
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	tm "github.com/buger/goterm"
+	"github.com/containers/common/libnetwork/types"
 	"github.com/containers/common/pkg/completion"
 	"github.com/containers/common/pkg/report"
-	"github.com/containers/podman/v3/cmd/podman/common"
-	"github.com/containers/podman/v3/cmd/podman/registry"
-	"github.com/containers/podman/v3/cmd/podman/utils"
-	"github.com/containers/podman/v3/cmd/podman/validate"
-	"github.com/containers/podman/v3/libpod/network/types"
-	"github.com/containers/podman/v3/pkg/domain/entities"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/docker/go-units"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
@@ -75,12 +77,12 @@ func listFlagSet(cmd *cobra.Command) {
 	flags.BoolVar(&listOpts.External, "external", false, "Show containers in storage not controlled by Podman")
 
 	filterFlagName := "filter"
-	flags.StringSliceVarP(&filters, filterFlagName, "f", []string{}, "Filter output based on conditions given")
+	flags.StringArrayVarP(&filters, filterFlagName, "f", []string{}, "Filter output based on conditions given")
 	_ = cmd.RegisterFlagCompletionFunc(filterFlagName, common.AutocompletePsFilters)
 
 	formatFlagName := "format"
 	flags.StringVar(&listOpts.Format, formatFlagName, "", "Pretty-print containers to JSON or using a Go template")
-	_ = cmd.RegisterFlagCompletionFunc(formatFlagName, common.AutocompleteFormat(entities.ListContainer{}))
+	_ = cmd.RegisterFlagCompletionFunc(formatFlagName, common.AutocompleteFormat(&psReporter{}))
 
 	lastFlagName := "last"
 	flags.IntVarP(&listOpts.Last, lastFlagName, "n", -1, "Print the n last created containers (all states)")
@@ -108,25 +110,25 @@ func listFlagSet(cmd *cobra.Command) {
 func checkFlags(c *cobra.Command) error {
 	// latest, and last are mutually exclusive.
 	if listOpts.Last >= 0 && listOpts.Latest {
-		return errors.Errorf("last and latest are mutually exclusive")
+		return errors.New("last and latest are mutually exclusive")
 	}
 	// Quiet conflicts with size and namespace and is overridden by a Go
 	// template.
 	if listOpts.Quiet {
 		if listOpts.Size || listOpts.Namespace {
-			return errors.Errorf("quiet conflicts with size and namespace")
+			return errors.New("quiet conflicts with size and namespace")
 		}
 	}
 	// Size and namespace conflict with each other
 	if listOpts.Size && listOpts.Namespace {
-		return errors.Errorf("size and namespace options conflict")
+		return errors.New("size and namespace options conflict")
 	}
 
 	if listOpts.Watch > 0 && listOpts.Latest {
 		return errors.New("the watch and latest flags cannot be used together")
 	}
-	cfg := registry.PodmanConfig()
-	if cfg.Engine.Namespace != "" {
+	podmanConfig := registry.PodmanConfig()
+	if podmanConfig.ContainersConf.Engine.Namespace != "" {
 		if c.Flag("storage").Changed && listOpts.External {
 			return errors.New("--namespace and --external flags can not both be set")
 		}
@@ -159,7 +161,7 @@ func jsonOut(responses []entities.ListContainer) error {
 	return nil
 }
 
-func quietOut(responses []entities.ListContainer) error {
+func quietOut(responses []entities.ListContainer) {
 	for _, r := range responses {
 		id := r.ID
 		if !noTrunc {
@@ -167,7 +169,6 @@ func quietOut(responses []entities.ListContainer) error {
 		}
 		fmt.Println(id)
 	}
-	return nil
 }
 
 func getResponses() ([]entities.ListContainer, error) {
@@ -188,12 +189,17 @@ func ps(cmd *cobra.Command, _ []string) error {
 	if err := checkFlags(cmd); err != nil {
 		return err
 	}
+
+	if !listOpts.Pod {
+		listOpts.Pod = strings.Contains(listOpts.Format, ".PodName")
+	}
+
 	for _, f := range filters {
-		split := strings.SplitN(f, "=", 2)
-		if len(split) == 1 {
-			return errors.Errorf("invalid filter %q", f)
+		fname, filter, hasFilter := strings.Cut(f, "=")
+		if !hasFilter {
+			return fmt.Errorf("invalid filter %q", f)
 		}
-		listOpts.Filters[split[0]] = append(listOpts.Filters[split[0]], split[1])
+		listOpts.Filters[fname] = append(listOpts.Filters[fname], filter)
 	}
 	listContainers, err := getResponses()
 	if err != nil {
@@ -210,7 +216,8 @@ func ps(cmd *cobra.Command, _ []string) error {
 	case report.IsJSON(listOpts.Format):
 		return jsonOut(listContainers)
 	case listOpts.Quiet && !cmd.Flags().Changed("format"):
-		return quietOut(listContainers)
+		quietOut(listContainers)
+		return nil
 	}
 
 	responses := make([]psReporter, 0, len(listContainers))
@@ -220,30 +227,28 @@ func ps(cmd *cobra.Command, _ []string) error {
 
 	hdrs, format := createPsOut()
 
+	var origin report.Origin
 	noHeading, _ := cmd.Flags().GetBool("noheading")
 	if cmd.Flags().Changed("format") {
 		noHeading = noHeading || !report.HasTable(listOpts.Format)
-		format = report.NormalizeFormat(listOpts.Format)
-		format = report.EnforceRange(format)
+		format = listOpts.Format
+		origin = report.OriginUser
+	} else {
+		origin = report.OriginPodman
 	}
 	ns := strings.NewReplacer(".Namespaces.", ".")
 	format = ns.Replace(format)
 
-	tmpl, err := report.NewTemplate("list").Parse(format)
+	rpt, err := report.New(os.Stdout, cmd.Name()).Parse(origin, format)
 	if err != nil {
 		return err
 	}
-
-	w, err := report.NewWriterDefault(os.Stdout)
-	if err != nil {
-		return err
-	}
-	defer w.Flush()
+	defer rpt.Flush()
 
 	headers := func() error { return nil }
 	if !noHeading {
 		headers = func() error {
-			return tmpl.Execute(w, hdrs)
+			return rpt.Execute(hdrs)
 		}
 	}
 
@@ -268,10 +273,10 @@ func ps(cmd *cobra.Command, _ []string) error {
 			if err := headers(); err != nil {
 				return err
 			}
-			if err := tmpl.Execute(w, responses); err != nil {
+			if err := rpt.Execute(responses); err != nil {
 				return err
 			}
-			if err := w.Flush(); err != nil {
+			if err := rpt.Flush(); err != nil {
 				// we usually do not care about Flush() failures but here do not loop if Flush() has failed
 				return err
 			}
@@ -282,7 +287,7 @@ func ps(cmd *cobra.Command, _ []string) error {
 		if err := headers(); err != nil {
 			return err
 		}
-		if err := tmpl.Execute(w, responses); err != nil {
+		if err := rpt.Execute(responses); err != nil {
 			return err
 		}
 	}
@@ -302,6 +307,7 @@ func createPsOut() ([]map[string]string, string) {
 		"PIDNS":        "pidns",
 		"Pod":          "pod id",
 		"PodName":      "podname", // undo camelcase space break
+		"Restarts":     "restarts",
 		"RunningFor":   "running for",
 		"UTS":          "uts",
 		"User":         "userns",
@@ -336,6 +342,11 @@ func (l psReporter) ImageID() string {
 	return l.ListContainer.ImageID
 }
 
+// Labels returns a map of the pod's labels
+func (l psReporter) Label(name string) string {
+	return l.ListContainer.Labels[name]
+}
+
 // ID returns the ID of the container
 func (l psReporter) ID() string {
 	if !noTrunc {
@@ -353,31 +364,34 @@ func (l psReporter) Pod() string {
 	return l.ListContainer.Pod
 }
 
-// State returns the container state in human duration
-func (l psReporter) State() string {
+// Status returns the container status in the default ps output format.
+func (l psReporter) Status() string {
 	var state string
 	switch l.ListContainer.State {
 	case "running":
 		t := units.HumanDuration(time.Since(time.Unix(l.StartedAt, 0)))
-		state = "Up " + t + " ago"
-	case "configured":
-		state = "Created"
+		state = "Up " + t
 	case "exited", "stopped":
 		t := units.HumanDuration(time.Since(time.Unix(l.ExitedAt, 0)))
 		state = fmt.Sprintf("Exited (%d) %s ago", l.ExitCode, t)
 	default:
-		state = l.ListContainer.State
+		// Need to capitalize the first letter to match Docker.
+
+		// strings.Title is deprecated since go 1.18
+		// However for our use case it is still fine. The recommended replacement
+		// is adding about 400kb binary size so let's keep using this for now.
+		//nolint:staticcheck
+		state = strings.Title(l.ListContainer.State)
+	}
+	hc := l.ListContainer.Status
+	if hc != "" {
+		state += " (" + hc + ")"
 	}
 	return state
 }
 
-// Status is a synonym for State()
-func (l psReporter) Status() string {
-	hc := l.ListContainer.Status
-	if hc != "" {
-		return l.State() + " (" + hc + ")"
-	}
-	return l.State()
+func (l psReporter) Restarts() string {
+	return strconv.Itoa(int(l.ListContainer.Restarts))
 }
 
 func (l psReporter) RunningFor() string {
@@ -421,10 +435,7 @@ func (l psReporter) Networks() string {
 // Ports converts from Portmappings to the string form
 // required by ps
 func (l psReporter) Ports() string {
-	if len(l.ListContainer.Ports) < 1 {
-		return ""
-	}
-	return portsToString(l.ListContainer.Ports)
+	return portsToString(l.ListContainer.Ports, l.ListContainer.ExposedPorts)
 }
 
 // CreatedAt returns the container creation time in string format.  podman
@@ -433,7 +444,7 @@ func (l psReporter) CreatedAt() string {
 	return l.Created.String()
 }
 
-// CreateHuman allows us to output the created time in human readable format
+// CreatedHuman allows us to output the created time in human readable format
 func (l psReporter) CreatedHuman() string {
 	return units.HumanDuration(time.Since(l.Created)) + " ago"
 }
@@ -476,8 +487,8 @@ func (l psReporter) UTS() string {
 // portsToString converts the ports used to a string of the from "port1, port2"
 // and also groups a continuous list of ports into a readable format.
 // The format is IP:HostPort(-Range)->ContainerPort(-Range)/Proto
-func portsToString(ports []types.PortMapping) string {
-	if len(ports) == 0 {
+func portsToString(ports []types.PortMapping, exposedPorts map[uint16][]string) string {
+	if len(ports) == 0 && len(exposedPorts) == 0 {
 		return ""
 	}
 	sb := &strings.Builder{}
@@ -499,6 +510,20 @@ func portsToString(ports []types.PortMapping) string {
 			}
 		}
 	}
+
+	// iterating a map is not deterministic so let's convert slice first and sort by port to make it deterministic
+	sortedPorts := make([]uint16, 0, len(exposedPorts))
+	for port := range exposedPorts {
+		sortedPorts = append(sortedPorts, port)
+	}
+	slices.Sort(sortedPorts)
+	for _, port := range sortedPorts {
+		for _, protocol := range exposedPorts[port] {
+			// exposed ports do not have a host part and are just written as "NUM/PROTO"
+			fmt.Fprintf(sb, "%d/%s, ", port, protocol)
+		}
+	}
+
 	display := sb.String()
 	// make sure to trim the last ", " of the string
 	return display[:len(display)-2]

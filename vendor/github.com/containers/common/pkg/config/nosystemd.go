@@ -1,4 +1,4 @@
-// +build !systemd !cgo
+//go:build !systemd || !cgo
 
 package config
 
@@ -20,5 +20,9 @@ func defaultLogDriver() string {
 }
 
 func useSystemd() bool {
+	return false
+}
+
+func useJournald() bool {
 	return false
 }

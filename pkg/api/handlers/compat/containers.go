@@ -1,7 +1,10 @@
+//go:build !remote
+
 package compat
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -10,32 +13,33 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/containers/podman/v3/libpod"
-	"github.com/containers/podman/v3/libpod/define"
-	"github.com/containers/podman/v3/pkg/api/handlers"
-	"github.com/containers/podman/v3/pkg/api/handlers/utils"
-	api "github.com/containers/podman/v3/pkg/api/types"
-	"github.com/containers/podman/v3/pkg/domain/entities"
-	"github.com/containers/podman/v3/pkg/domain/filters"
-	"github.com/containers/podman/v3/pkg/domain/infra/abi"
-	"github.com/containers/podman/v3/pkg/ps"
-	"github.com/containers/podman/v3/pkg/signal"
-	"github.com/containers/podman/v3/pkg/util"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/api/handlers"
+	"github.com/containers/podman/v5/pkg/api/handlers/utils"
+	api "github.com/containers/podman/v5/pkg/api/types"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/filters"
+	"github.com/containers/podman/v5/pkg/domain/infra/abi"
+	"github.com/containers/podman/v5/pkg/ps"
+	"github.com/containers/podman/v5/pkg/signal"
+	"github.com/containers/podman/v5/pkg/util"
 	"github.com/docker/docker/api/types"
+	dockerBackend "github.com/docker/docker/api/types/backend"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/go-connections/nat"
 	"github.com/docker/go-units"
-	"github.com/gorilla/schema"
-	"github.com/pkg/errors"
+	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 )
 
 func RemoveContainer(w http.ResponseWriter, r *http.Request) {
-	decoder := r.Context().Value(api.DecoderKey).(*schema.Decoder)
+	decoder := utils.GetDecoder(r)
 	query := struct {
 		Force         bool  `schema:"force"`
 		Ignore        bool  `schema:"ignore"`
+		Depend        bool  `schema:"depend"`
 		Link          bool  `schema:"link"`
 		Timeout       *uint `schema:"timeout"`
 		DockerVolumes bool  `schema:"v"`
@@ -45,8 +49,7 @@ func RemoveContainer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := decoder.Decode(&query, r.URL.Query()); err != nil {
-		utils.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest,
-			errors.Wrapf(err, "failed to parse parameters for %s", r.URL.String()))
+		utils.Error(w, http.StatusBadRequest, fmt.Errorf("failed to parse parameters for %s: %w", r.URL.String(), err))
 		return
 	}
 
@@ -57,10 +60,10 @@ func RemoveContainer(w http.ResponseWriter, r *http.Request) {
 	if utils.IsLibpodRequest(r) {
 		options.Volumes = query.LibpodVolumes
 		options.Timeout = query.Timeout
+		options.Depend = query.Depend
 	} else {
 		if query.Link {
-			utils.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest,
-				utils.ErrLinkNotSupport)
+			utils.Error(w, http.StatusBadRequest, utils.ErrLinkNotSupport)
 			return
 		}
 		options.Volumes = query.DockerVolumes
@@ -71,9 +74,9 @@ func RemoveContainer(w http.ResponseWriter, r *http.Request) {
 	// code.
 	containerEngine := abi.ContainerEngine{Libpod: runtime}
 	name := utils.GetName(r)
-	report, err := containerEngine.ContainerRm(r.Context(), []string{name}, options)
+	reports, err := containerEngine.ContainerRm(r.Context(), []string{name}, options)
 	if err != nil {
-		if errors.Cause(err) == define.ErrNoSuchCtr {
+		if errors.Is(err, define.ErrNoSuchCtr) {
 			utils.ContainerNotFound(w, name, err)
 			return
 		}
@@ -81,22 +84,25 @@ func RemoveContainer(w http.ResponseWriter, r *http.Request) {
 		utils.InternalServerError(w, err)
 		return
 	}
-	if len(report) > 0 && report[0].Err != nil {
-		err = report[0].Err
-		if errors.Cause(err) == define.ErrNoSuchCtr {
+	if len(reports) > 0 && reports[0].Err != nil {
+		err = reports[0].Err
+		if errors.Is(err, define.ErrNoSuchCtr) {
 			utils.ContainerNotFound(w, name, err)
 			return
 		}
 		utils.InternalServerError(w, err)
 		return
 	}
-
+	if utils.IsLibpodRequest(r) {
+		utils.WriteResponse(w, http.StatusOK, reports)
+		return
+	}
 	utils.WriteResponse(w, http.StatusNoContent, nil)
 }
 
 func ListContainers(w http.ResponseWriter, r *http.Request) {
 	runtime := r.Context().Value(api.RuntimeKey).(*libpod.Runtime)
-	decoder := r.Context().Value(api.DecoderKey).(*schema.Decoder)
+	decoder := utils.GetDecoder(r)
 	query := struct {
 		All   bool `schema:"all"`
 		Limit int  `schema:"limit"`
@@ -107,18 +113,18 @@ func ListContainers(w http.ResponseWriter, r *http.Request) {
 
 	filterMap, err := util.PrepareFilters(r)
 	if err != nil {
-		utils.Error(w, "Something went wrong.", http.StatusInternalServerError, errors.Wrapf(err, "failed to decode filter parameters for %s", r.URL.String()))
+		utils.Error(w, http.StatusInternalServerError, fmt.Errorf("failed to decode filter parameters for %s: %w", r.URL.String(), err))
 		return
 	}
 
 	if err := decoder.Decode(&query, r.URL.Query()); err != nil {
-		utils.Error(w, "Something went wrong.", http.StatusInternalServerError, errors.Wrapf(err, "failed to parse parameters for %s", r.URL.String()))
+		utils.Error(w, http.StatusInternalServerError, fmt.Errorf("failed to parse parameters for %s: %w", r.URL.String(), err))
 		return
 	}
 
 	filterFuncs := make([]libpod.ContainerFilter, 0, len(*filterMap))
 	all := query.All || query.Limit > 0
-	if len((*filterMap)) > 0 {
+	if len(*filterMap) > 0 {
 		for k, v := range *filterMap {
 			generatedFunc, err := filters.GenerateContainerFilterFuncs(k, v, runtime)
 			if err != nil {
@@ -143,7 +149,7 @@ func ListContainers(w http.ResponseWriter, r *http.Request) {
 		filterFuncs = append(filterFuncs, runningOnly)
 	}
 
-	containers, err := runtime.GetContainers(filterFuncs...)
+	containers, err := runtime.GetContainers(false, filterFuncs...)
 	if err != nil {
 		utils.InternalServerError(w, err)
 		return
@@ -161,7 +167,7 @@ func ListContainers(w http.ResponseWriter, r *http.Request) {
 	for _, ctnr := range containers {
 		api, err := LibpodToContainer(ctnr, query.Size)
 		if err != nil {
-			if errors.Cause(err) == define.ErrNoSuchCtr {
+			if errors.Is(err, define.ErrNoSuchCtr) {
 				// container was removed between the initial fetch of the list and conversion
 				logrus.Debugf("Container %s removed between initial fetch and conversion, ignoring in output", ctnr.ID())
 				continue
@@ -176,7 +182,7 @@ func ListContainers(w http.ResponseWriter, r *http.Request) {
 
 func GetContainer(w http.ResponseWriter, r *http.Request) {
 	runtime := r.Context().Value(api.RuntimeKey).(*libpod.Runtime)
-	decoder := r.Context().Value(api.DecoderKey).(*schema.Decoder)
+	decoder := utils.GetDecoder(r)
 	query := struct {
 		Size bool `schema:"size"`
 	}{
@@ -184,7 +190,7 @@ func GetContainer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := decoder.Decode(&query, r.URL.Query()); err != nil {
-		utils.Error(w, "Something went wrong.", http.StatusBadRequest, errors.Wrapf(err, "failed to parse parameters for %s", r.URL.String()))
+		utils.Error(w, http.StatusBadRequest, fmt.Errorf("failed to parse parameters for %s: %w", r.URL.String(), err))
 		return
 	}
 
@@ -205,14 +211,14 @@ func GetContainer(w http.ResponseWriter, r *http.Request) {
 func KillContainer(w http.ResponseWriter, r *http.Request) {
 	// /{version}/containers/(name)/kill
 	runtime := r.Context().Value(api.RuntimeKey).(*libpod.Runtime)
-	decoder := r.Context().Value(api.DecoderKey).(*schema.Decoder)
+	decoder := utils.GetDecoder(r)
 	query := struct {
 		Signal string `schema:"signal"`
 	}{
 		Signal: "KILL",
 	}
 	if err := decoder.Decode(&query, r.URL.Query()); err != nil {
-		utils.Error(w, "Something went wrong.", http.StatusBadRequest, errors.Wrapf(err, "failed to parse parameters for %s", r.URL.String()))
+		utils.Error(w, http.StatusBadRequest, fmt.Errorf("failed to parse parameters for %s: %w", r.URL.String(), err))
 		return
 	}
 
@@ -225,12 +231,12 @@ func KillContainer(w http.ResponseWriter, r *http.Request) {
 	}
 	report, err := containerEngine.ContainerKill(r.Context(), []string{name}, options)
 	if err != nil {
-		if errors.Cause(err) == define.ErrCtrStateInvalid ||
-			errors.Cause(err) == define.ErrCtrStopped {
-			utils.Error(w, fmt.Sprintf("Container %s is not running", name), http.StatusConflict, err)
+		if errors.Is(err, define.ErrCtrStateInvalid) ||
+			errors.Is(err, define.ErrCtrStopped) {
+			utils.Error(w, http.StatusConflict, err)
 			return
 		}
-		if errors.Cause(err) == define.ErrNoSuchCtr {
+		if errors.Is(err, define.ErrNoSuchCtr) {
 			utils.ContainerNotFound(w, name, err)
 			return
 		}
@@ -240,6 +246,11 @@ func KillContainer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(report) > 0 && report[0].Err != nil {
+		if errors.Is(report[0].Err, define.ErrCtrStateInvalid) ||
+			errors.Is(report[0].Err, define.ErrCtrStopped) {
+			utils.Error(w, http.StatusConflict, report[0].Err)
+			return
+		}
 		utils.InternalServerError(w, report[0].Err)
 		return
 	}
@@ -251,13 +262,13 @@ func KillContainer(w http.ResponseWriter, r *http.Request) {
 			utils.InternalServerError(w, err)
 			return
 		}
-		if sig == 0 || syscall.Signal(sig) == syscall.SIGKILL {
+		if sig == 0 || sig == syscall.SIGKILL {
 			opts := entities.WaitOptions{
-				Condition: []define.ContainerStatus{define.ContainerStateExited, define.ContainerStateStopped},
-				Interval:  time.Millisecond * 250,
+				Conditions: []string{define.ContainerStateExited.String(), define.ContainerStateStopped.String()},
+				Interval:   time.Millisecond * 250,
 			}
 			if _, err := containerEngine.ContainerWait(r.Context(), []string{name}, opts); err != nil {
-				utils.Error(w, "Something went wrong.", http.StatusInternalServerError, err)
+				utils.Error(w, http.StatusInternalServerError, err)
 				return
 			}
 		}
@@ -286,13 +297,16 @@ func LibpodToContainer(l *libpod.Container, sz bool) (*handlers.Container, error
 		return nil, err
 	}
 	stateStr := state.String()
-	if stateStr == "configured" {
-		stateStr = "created"
+
+	// Some docker states are not the same as ours. This makes sure the state string stays true to the Docker API
+	if state == define.ContainerStateCreated {
+		stateStr = define.ContainerStateConfigured.String()
 	}
 
-	if state == define.ContainerStateConfigured || state == define.ContainerStateCreated {
+	switch state {
+	case define.ContainerStateConfigured, define.ContainerStateCreated:
 		status = "Created"
-	} else if state == define.ContainerStateStopped || state == define.ContainerStateExited {
+	case define.ContainerStateStopped, define.ContainerStateExited:
 		exitCode, _, err := l.ExitCode()
 		if err != nil {
 			return nil, err
@@ -302,7 +316,7 @@ func LibpodToContainer(l *libpod.Container, sz bool) (*handlers.Container, error
 			return nil, err
 		}
 		status = fmt.Sprintf("Exited (%d) %s ago", exitCode, units.HumanDuration(time.Since(finishedTime)))
-	} else if state == define.ContainerStateRunning || state == define.ContainerStatePaused {
+	case define.ContainerStateRunning, define.ContainerStatePaused:
 		startedTime, err := l.StartedTime()
 		if err != nil {
 			return nil, err
@@ -311,11 +325,11 @@ func LibpodToContainer(l *libpod.Container, sz bool) (*handlers.Container, error
 		if state == define.ContainerStatePaused {
 			status += " (Paused)"
 		}
-	} else if state == define.ContainerStateRemoving {
+	case define.ContainerStateRemoving:
 		status = "Removal In Progress"
-	} else if state == define.ContainerStateStopping {
+	case define.ContainerStateStopping:
 		status = "Stopping"
-	} else {
+	default:
 		status = "Unknown"
 	}
 
@@ -337,8 +351,8 @@ func LibpodToContainer(l *libpod.Container, sz bool) (*handlers.Container, error
 	for idx, portMapping := range portMappings {
 		ports[idx] = types.Port{
 			IP:          portMapping.HostIP,
-			PrivatePort: uint16(portMapping.ContainerPort),
-			PublicPort:  uint16(portMapping.HostPort),
+			PrivatePort: portMapping.ContainerPort,
+			PublicPort:  portMapping.HostPort,
 			Type:        portMapping.Protocol,
 		}
 	}
@@ -356,32 +370,55 @@ func LibpodToContainer(l *libpod.Container, sz bool) (*handlers.Container, error
 		return nil, err
 	}
 
-	return &handlers.Container{Container: types.Container{
-		ID:         l.ID(),
-		Names:      []string{fmt.Sprintf("/%s", l.Name())},
-		Image:      imageName,
-		ImageID:    imageID,
-		Command:    strings.Join(l.Command(), " "),
-		Created:    l.CreatedTime().Unix(),
-		Ports:      ports,
-		SizeRw:     sizeRW,
-		SizeRootFs: sizeRootFs,
-		Labels:     l.Labels(),
-		State:      stateStr,
-		Status:     status,
-		HostConfig: struct {
-			NetworkMode string `json:",omitempty"`
-		}{
-			"host"},
-		NetworkSettings: &networkSettings,
-		Mounts:          nil,
-	},
-		ContainerCreateConfig: types.ContainerCreateConfig{},
+	m, err := json.Marshal(inspect.Mounts)
+	if err != nil {
+		return nil, err
+	}
+	mounts := []types.MountPoint{}
+	if err := json.Unmarshal(m, &mounts); err != nil {
+		return nil, err
+	}
+
+	return &handlers.Container{
+		Container: types.Container{
+			ID:         l.ID(),
+			Names:      []string{fmt.Sprintf("/%s", l.Name())},
+			Image:      imageName,
+			ImageID:    "sha256:" + imageID,
+			Command:    strings.Join(l.Command(), " "),
+			Created:    l.CreatedTime().Unix(),
+			Ports:      ports,
+			SizeRw:     sizeRW,
+			SizeRootFs: sizeRootFs,
+			Labels:     l.Labels(),
+			State:      stateStr,
+			Status:     status,
+			// FIXME: this seems broken, the field is never shown in the API output.
+			HostConfig: struct {
+				NetworkMode string            `json:",omitempty"`
+				Annotations map[string]string `json:",omitempty"`
+			}{
+				NetworkMode: "host",
+				// TODO: add annotations here for >= v1.46
+			},
+			NetworkSettings: &networkSettings,
+			Mounts:          mounts,
+		},
+		ContainerCreateConfig: dockerBackend.ContainerCreateConfig{},
 	}, nil
 }
 
+func convertSecondaryIPPrefixLen(input *define.InspectNetworkSettings, output *types.NetworkSettings) {
+	for index, ip := range input.SecondaryIPAddresses {
+		output.SecondaryIPAddresses[index].PrefixLen = ip.PrefixLength
+	}
+	for index, ip := range input.SecondaryIPv6Addresses {
+		output.SecondaryIPv6Addresses[index].PrefixLen = ip.PrefixLength
+	}
+}
+
 func LibpodToContainerJSON(l *libpod.Container, sz bool) (*types.ContainerJSON, error) {
-	_, imageName := l.Image()
+	imageID, imageName := l.Image()
 	inspect, err := l.Inspect(sz)
 	if err != nil {
 		return nil, err
@@ -405,28 +442,34 @@ func LibpodToContainerJSON(l *libpod.Container, sz bool) (*types.ContainerJSON, 
 		state.Running = true
 	}
 
-	// docker calls the configured state "created"
-	if state.Status == define.ContainerStateConfigured.String() {
-		state.Status = define.ContainerStateCreated.String()
+	// Dockers created state is our configured state
+	if state.Status == define.ContainerStateCreated.String() {
+		state.Status = define.ContainerStateConfigured.String()
 	}
 
 	if l.HasHealthCheck() && state.Status != "created" {
-		state.Health = &types.Health{
-			Status:        inspect.State.Health.Status,
-			FailingStreak: inspect.State.Health.FailingStreak,
-		}
+		state.Health = &types.Health{}
+		if inspect.State.Health != nil {
+			state.Health.Status = inspect.State.Health.Status
+			state.Health.FailingStreak = inspect.State.Health.FailingStreak
+			log := inspect.State.Health.Log
 
-		log := inspect.State.Health.Log
-
-		for _, item := range log {
-			res := &types.HealthcheckResult{}
-			s, _ := time.Parse(time.RFC3339Nano, item.Start)
-			e, _ := time.Parse(time.RFC3339Nano, item.End)
-			res.Start = s
-			res.End = e
-			res.ExitCode = item.ExitCode
-			res.Output = item.Output
-			state.Health.Log = append(state.Health.Log, res)
+			for _, item := range log {
+				res := &types.HealthcheckResult{}
+				s, err := time.Parse(time.RFC3339Nano, item.Start)
+				if err != nil {
+					return nil, err
+				}
+				e, err := time.Parse(time.RFC3339Nano, item.End)
+				if err != nil {
+					return nil, err
+				}
+				res.Start = s
+				res.End = e
+				res.ExitCode = item.ExitCode
+				res.Output = item.Output
+				state.Health.Log = append(state.Health.Log, res)
+			}
 		}
 	}
 
@@ -441,6 +484,7 @@ func LibpodToContainerJSON(l *libpod.Container, sz bool) (*types.ContainerJSON, 
 	if err := json.Unmarshal(h, &hc); err != nil {
 		return nil, err
 	}
+	sort.Strings(hc.Binds)
 
 	// k8s-file == json-file
 	if hc.LogConfig.Type == define.KubernetesLogging {
@@ -461,7 +505,7 @@ func LibpodToContainerJSON(l *libpod.Container, sz bool) (*types.ContainerJSON, 
 		Path:            inspect.Path,
 		Args:            inspect.Args,
 		State:           &state,
-		Image:           imageName,
+		Image:           "sha256:" + imageID,
 		ResolvConfPath:  inspect.ResolvConfPath,
 		HostnamePath:    inspect.HostnamePath,
 		HostsPath:       inspect.HostsPath,
@@ -492,12 +536,12 @@ func LibpodToContainerJSON(l *libpod.Container, sz bool) (*types.ContainerJSON, 
 	stopTimeout := int(l.StopTimeout())
 
 	exposedPorts := make(nat.PortSet)
-	for ep := range inspect.HostConfig.PortBindings {
-		splitp := strings.SplitN(ep, "/", 2)
-		if len(splitp) != 2 {
-			return nil, errors.Errorf("PORT/PROTOCOL Format required for %q", ep)
+	for ep := range inspect.NetworkSettings.Ports {
+		port, proto, ok := strings.Cut(ep, "/")
+		if !ok {
+			return nil, fmt.Errorf("PORT/PROTOCOL Format required for %q", ep)
 		}
-		exposedPort, err := nat.NewPort(splitp[1], splitp[0])
+		exposedPort, err := nat.NewPort(proto, port)
 		if err != nil {
 			return nil, err
 		}
@@ -570,6 +614,9 @@ func LibpodToContainerJSON(l *libpod.Container, sz bool) (*types.ContainerJSON, 
 	if err := json.Unmarshal(n, &networkSettings); err != nil {
 		return nil, err
 	}
+
+	convertSecondaryIPPrefixLen(inspect.NetworkSettings, &networkSettings)
+
 	// do not report null instead use an empty map
 	if networkSettings.Networks == nil {
 		networkSettings.Networks = map[string]*network.EndpointSettings{}
@@ -592,14 +639,14 @@ func formatCapabilities(slice []string) {
 
 func RenameContainer(w http.ResponseWriter, r *http.Request) {
 	runtime := r.Context().Value(api.RuntimeKey).(*libpod.Runtime)
-	decoder := r.Context().Value(api.DecoderKey).(*schema.Decoder)
+	decoder := utils.GetDecoder(r)
 
 	name := utils.GetName(r)
 	query := struct {
 		Name string `schema:"name"`
 	}{}
 	if err := decoder.Decode(&query, r.URL.Query()); err != nil {
-		utils.Error(w, "Something went wrong.", http.StatusBadRequest, errors.Wrapf(err, "failed to parse parameters for %s", r.URL.String()))
+		utils.Error(w, http.StatusBadRequest, fmt.Errorf("failed to parse parameters for %s: %w", r.URL.String(), err))
 		return
 	}
 
@@ -610,8 +657,8 @@ func RenameContainer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, err := runtime.RenameContainer(r.Context(), ctr, query.Name); err != nil {
-		if errors.Cause(err) == define.ErrPodExists || errors.Cause(err) == define.ErrCtrExists {
-			utils.Error(w, "Something went wrong.", http.StatusConflict, err)
+		if errors.Is(err, define.ErrPodExists) || errors.Is(err, define.ErrCtrExists) {
+			utils.Error(w, http.StatusConflict, err)
 			return
 		}
 		utils.InternalServerError(w, err)
@@ -619,4 +666,134 @@ func RenameContainer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	utils.WriteResponse(w, http.StatusNoContent, nil)
+}
+
+func UpdateContainer(w http.ResponseWriter, r *http.Request) {
+	runtime := r.Context().Value(api.RuntimeKey).(*libpod.Runtime)
+	name := utils.GetName(r)
+
+	ctr, err := runtime.LookupContainer(name)
+	if err != nil {
+		utils.ContainerNotFound(w, name, err)
+		return
+	}
+
+	options := new(container.UpdateConfig)
+	if err := json.NewDecoder(r.Body).Decode(options); err != nil {
+		utils.Error(w, http.StatusInternalServerError, fmt.Errorf("decoding request body: %w", err))
+		return
+	}
+
+	// Only handle the bits of update that Docker uses as examples.
+	// For example, the update API claims to be able to update devices for
+	// existing containers... Which I am very dubious about.
+	// Ignore bits like that unless someone asks us for them.
+
+	// We're going to be editing this, so we have to deep-copy to not affect
+	// the container's own resources
+	resources := new(spec.LinuxResources)
+	oldResources := ctr.LinuxResources()
+	if oldResources != nil {
+		if err := libpod.JSONDeepCopy(oldResources, resources); err != nil {
+			utils.Error(w, http.StatusInternalServerError, fmt.Errorf("copying old resource limits: %w", err))
+			return
+		}
+	}
+
+	// CPU limits
+	cpu := resources.CPU
+	if cpu == nil {
+		cpu = new(spec.LinuxCPU)
+	}
+	useCPU := false
+	if options.CPUShares != 0 {
+		shares := uint64(options.CPUShares)
+		cpu.Shares = &shares
+		useCPU = true
+	}
+	if options.CPUPeriod != 0 {
+		period := uint64(options.CPUPeriod)
+		cpu.Period = &period
+		useCPU = true
+	}
+	if options.CPUQuota != 0 {
+		cpu.Quota = &options.CPUQuota
+		useCPU = true
+	}
+	if options.CPURealtimeRuntime != 0 {
+		cpu.RealtimeRuntime = &options.CPURealtimeRuntime
+		useCPU = true
+	}
+	if options.CPURealtimePeriod != 0 {
+		period := uint64(options.CPURealtimePeriod)
+		cpu.RealtimePeriod = &period
+		useCPU = true
+	}
+	if options.CpusetCpus != "" {
+		cpu.Cpus = options.CpusetCpus
+		useCPU = true
+	}
+	if options.CpusetMems != "" {
+		cpu.Mems = options.CpusetMems
+		useCPU = true
+	}
+	if useCPU {
+		resources.CPU = cpu
+	}
+
+	// Memory limits
+	mem := resources.Memory
+	if mem == nil {
+		mem = new(spec.LinuxMemory)
+	}
+	useMem := false
+	if options.Memory != 0 {
+		mem.Limit = &options.Memory
+		useMem = true
+	}
+	if options.MemorySwap != 0 {
+		mem.Swap = &options.MemorySwap
+		useMem = true
+	}
+	if options.MemoryReservation != 0 {
+		mem.Reservation = &options.MemoryReservation
+		useMem = true
+	}
+	if useMem {
+		resources.Memory = mem
+	}
+
+	// PIDs limit
+	if options.PidsLimit != nil {
+		if resources.Pids == nil {
+			resources.Pids = new(spec.LinuxPids)
+		}
+		resources.Pids.Limit = *options.PidsLimit
+	}
+
+	// Blkio Weight
+	if options.BlkioWeight != 0 {
+		if resources.BlockIO == nil {
+			resources.BlockIO = new(spec.LinuxBlockIO)
+		}
+		resources.BlockIO.Weight = &options.BlkioWeight
+	}
+
+	// Restart policy
+	localPolicy := string(options.RestartPolicy.Name)
+	restartPolicy := &localPolicy
+
+	var restartRetries *uint
+	if options.RestartPolicy.MaximumRetryCount != 0 {
+		localRetries := uint(options.RestartPolicy.MaximumRetryCount)
+		restartRetries = &localRetries
+	}
+
+	if err := ctr.Update(resources, restartPolicy, restartRetries); err != nil {
+		utils.Error(w, http.StatusInternalServerError, fmt.Errorf("updating container: %w", err))
+		return
+	}
+
+	responseStruct := container.ContainerUpdateOKBody{}
+	utils.WriteResponse(w, http.StatusOK, responseStruct)
 }

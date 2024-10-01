@@ -1,37 +1,38 @@
+//go:build !remote
+
 package libpod
 
 import (
+	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/containers/buildah/pkg/parse"
+	nettypes "github.com/containers/common/libnetwork/types"
 	"github.com/containers/common/pkg/config"
 	"github.com/containers/common/pkg/secrets"
 	"github.com/containers/image/v5/manifest"
 	"github.com/containers/image/v5/types"
-	"github.com/containers/podman/v3/libpod/define"
-	"github.com/containers/podman/v3/libpod/events"
-	nettypes "github.com/containers/podman/v3/libpod/network/types"
-	"github.com/containers/podman/v3/pkg/namespaces"
-	"github.com/containers/podman/v3/pkg/rootless"
-	"github.com/containers/podman/v3/pkg/specgen"
-	"github.com/containers/podman/v3/pkg/util"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/libpod/events"
+	"github.com/containers/podman/v5/pkg/namespaces"
+	"github.com/containers/podman/v5/pkg/specgen"
+	"github.com/containers/podman/v5/pkg/util"
 	"github.com/containers/storage"
+	"github.com/containers/storage/pkg/fileutils"
 	"github.com/containers/storage/pkg/idtools"
+	"github.com/containers/storage/pkg/regexp"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/runtime-tools/generate"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
-// Runtime Creation Options
-var (
-	// SdNotifyModeValues describes the only values that SdNotifyMode can be
-	SdNotifyModeValues = []string{define.SdNotifyModeContainer, define.SdNotifyModeConmon, define.SdNotifyModeIgnore}
-)
+var umaskRegex = regexp.Delayed(`^[0-7]{1,4}$`)
 
 // WithStorageConfig uses the given configuration to set up container storage.
 // If this is not specified, the system default configuration will be used
@@ -53,17 +54,6 @@ func WithStorageConfig(config storage.StoreOptions) RuntimeOption {
 		if config.GraphRoot != "" {
 			rt.storageConfig.GraphRoot = config.GraphRoot
 			rt.storageSet.GraphRootSet = true
-
-			// Also set libpod static dir, so we are a subdirectory
-			// of the c/storage store by default
-			rt.config.Engine.StaticDir = filepath.Join(config.GraphRoot, "libpod")
-			rt.storageSet.StaticDirSet = true
-
-			// Also set libpod volume path, so we are a subdirectory
-			// of the c/storage store by default
-			rt.config.Engine.VolumePath = filepath.Join(config.GraphRoot, "volumes")
-			rt.storageSet.VolumePathSet = true
-
 			setField = true
 		}
 
@@ -95,11 +85,18 @@ func WithStorageConfig(config storage.StoreOptions) RuntimeOption {
 			copy(rt.storageConfig.GIDMap, config.GIDMap)
 		}
 
+		if config.PullOptions != nil {
+			rt.storageConfig.PullOptions = make(map[string]string)
+			for k, v := range config.PullOptions {
+				rt.storageConfig.PullOptions[k] = v
+			}
+		}
+
 		// If any one of runroot, graphroot, graphdrivername,
 		// or graphdriveroptions are set, then GraphRoot and RunRoot
 		// must be set
 		if setField {
-			storeOpts, err := storage.DefaultStoreOptions(rootless.IsRootless(), rootless.GetRootlessUID())
+			storeOpts, err := storage.DefaultStoreOptions()
 			if err != nil {
 				return err
 			}
@@ -115,14 +112,25 @@ func WithStorageConfig(config storage.StoreOptions) RuntimeOption {
 	}
 }
 
-// WithDefaultTransport sets the default transport for retrieving images.
-func WithDefaultTransport(defaultTransport string) RuntimeOption {
+func WithTransientStore(transientStore bool) RuntimeOption {
 	return func(rt *Runtime) error {
 		if rt.valid {
 			return define.ErrRuntimeFinalized
 		}
 
-		rt.config.Engine.ImageDefaultTransport = defaultTransport
+		rt.storageConfig.TransientStore = transientStore
+
+		return nil
+	}
+}
+
+func WithImageStore(imageStore string) RuntimeOption {
+	return func(rt *Runtime) error {
+		if rt.valid {
+			return define.ErrRuntimeFinalized
+		}
+
+		rt.storageConfig.ImageStore = imageStore
 
 		return nil
 	}
@@ -144,26 +152,6 @@ func WithSignaturePolicy(path string) RuntimeOption {
 	}
 }
 
-// WithStateType sets the backing state implementation for libpod.
-// Please note that information is not portable between backing states.
-// As such, if this differs between two libpods running on the same system,
-// they will not share containers, and unspecified behavior may occur.
-func WithStateType(storeType config.RuntimeStateStore) RuntimeOption {
-	return func(rt *Runtime) error {
-		if rt.valid {
-			return define.ErrRuntimeFinalized
-		}
-
-		if storeType == config.InvalidStateStore {
-			return errors.Wrapf(define.ErrInvalidArg, "must provide a valid state store type")
-		}
-
-		rt.config.Engine.StateType = storeType
-
-		return nil
-	}
-}
-
 // WithOCIRuntime specifies an OCI runtime to use for running containers.
 func WithOCIRuntime(runtime string) RuntimeOption {
 	return func(rt *Runtime) error {
@@ -172,11 +160,22 @@ func WithOCIRuntime(runtime string) RuntimeOption {
 		}
 
 		if runtime == "" {
-			return errors.Wrapf(define.ErrInvalidArg, "must provide a valid path")
+			return fmt.Errorf("must provide a valid path: %w", define.ErrInvalidArg)
 		}
 
 		rt.config.Engine.OCIRuntime = runtime
 
+		return nil
+	}
+}
+
+// WithCtrOCIRuntime specifies an OCI runtime in container's config.
+func WithCtrOCIRuntime(runtime string) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+		ctr.config.OCIRuntime = runtime
 		return nil
 	}
 }
@@ -190,10 +189,10 @@ func WithConmonPath(path string) RuntimeOption {
 		}
 
 		if path == "" {
-			return errors.Wrapf(define.ErrInvalidArg, "must provide a valid path")
+			return fmt.Errorf("must provide a valid path: %w", define.ErrInvalidArg)
 		}
 
-		rt.config.Engine.ConmonPath = []string{path}
+		rt.config.Engine.ConmonPath.Set([]string{path})
 
 		return nil
 	}
@@ -206,8 +205,7 @@ func WithConmonEnv(environment []string) RuntimeOption {
 			return define.ErrRuntimeFinalized
 		}
 
-		rt.config.Engine.ConmonEnvVars = make([]string, len(environment))
-		copy(rt.config.Engine.ConmonEnvVars, environment)
+		rt.config.Engine.ConmonEnvVars.Set(environment)
 
 		return nil
 	}
@@ -250,8 +248,8 @@ func WithCgroupManager(manager string) RuntimeOption {
 		}
 
 		if manager != config.CgroupfsCgroupsManager && manager != config.SystemdCgroupsManager {
-			return errors.Wrapf(define.ErrInvalidArg, "CGroup manager must be one of %s and %s",
-				config.CgroupfsCgroupsManager, config.SystemdCgroupsManager)
+			return fmt.Errorf("cgroup manager must be one of %s and %s: %w",
+				config.CgroupfsCgroupsManager, config.SystemdCgroupsManager, define.ErrInvalidArg)
 		}
 
 		rt.config.Engine.CgroupManager = manager
@@ -269,7 +267,6 @@ func WithStaticDir(dir string) RuntimeOption {
 		}
 
 		rt.config.Engine.StaticDir = dir
-		rt.config.Engine.StaticDirSet = true
 
 		return nil
 	}
@@ -280,8 +277,8 @@ func WithStaticDir(dir string) RuntimeOption {
 func WithRegistriesConf(path string) RuntimeOption {
 	logrus.Debugf("Setting custom registries.conf: %q", path)
 	return func(rt *Runtime) error {
-		if _, err := os.Stat(path); err != nil {
-			return errors.Wrap(err, "locating specified registries.conf")
+		if err := fileutils.Exists(path); err != nil {
+			return fmt.Errorf("locating specified registries.conf: %w", err)
 		}
 		if rt.imageContext == nil {
 			rt.imageContext = &types.SystemContext{
@@ -290,6 +287,16 @@ func WithRegistriesConf(path string) RuntimeOption {
 		}
 
 		rt.imageContext.SystemRegistriesConfPath = path
+		return nil
+	}
+}
+
+// WithDatabaseBackend configures the runtime's database backend.
+func WithDatabaseBackend(value string) RuntimeOption {
+	logrus.Debugf("Setting custom database backend: %q", value)
+	return func(rt *Runtime) error {
+		// The value will be parsed later on.
+		rt.config.Engine.DBBackend = value
 		return nil
 	}
 }
@@ -303,16 +310,16 @@ func WithHooksDir(hooksDirs ...string) RuntimeOption {
 
 		for _, hooksDir := range hooksDirs {
 			if hooksDir == "" {
-				return errors.Wrap(define.ErrInvalidArg, "empty-string hook directories are not supported")
+				return fmt.Errorf("empty-string hook directories are not supported: %w", define.ErrInvalidArg)
 			}
 		}
 
-		rt.config.Engine.HooksDir = hooksDirs
+		rt.config.Engine.HooksDir.Set(hooksDirs)
 		return nil
 	}
 }
 
-// WithCDI sets the devices to check for for CDI configuration.
+// WithCDI sets the devices to check for CDI configuration.
 func WithCDI(devices []string) CtrCreateOption {
 	return func(ctr *Container) error {
 		if ctr.valid {
@@ -323,7 +330,7 @@ func WithCDI(devices []string) CtrCreateOption {
 	}
 }
 
-// WithStorageOpts sets the devices to check for for CDI configuration.
+// WithStorageOpts sets the devices to check for CDI configuration.
 func WithStorageOpts(storageOpts map[string]string) CtrCreateOption {
 	return func(ctr *Container) error {
 		if ctr.valid {
@@ -361,17 +368,7 @@ func WithTmpDir(dir string) RuntimeOption {
 			return define.ErrRuntimeFinalized
 		}
 		rt.config.Engine.TmpDir = dir
-		rt.config.Engine.TmpDirSet = true
 
-		return nil
-	}
-}
-
-// WithNoStore sets a bool on the runtime that we do not need
-// any containers storage.
-func WithNoStore() RuntimeOption {
-	return func(rt *Runtime) error {
-		rt.noStore = true
 		return nil
 	}
 }
@@ -390,8 +387,8 @@ func WithNoPivotRoot() RuntimeOption {
 	}
 }
 
-// WithCNIConfigDir sets the CNI configuration directory.
-func WithCNIConfigDir(dir string) RuntimeOption {
+// WithNetworkConfigDir sets the network configuration directory.
+func WithNetworkConfigDir(dir string) RuntimeOption {
 	return func(rt *Runtime) error {
 		if rt.valid {
 			return define.ErrRuntimeFinalized
@@ -410,7 +407,7 @@ func WithCNIPluginDir(dir string) RuntimeOption {
 			return define.ErrRuntimeFinalized
 		}
 
-		rt.config.Network.CNIPluginDirs = []string{dir}
+		rt.config.Network.CNIPluginDirs.Set([]string{dir})
 
 		return nil
 	}
@@ -446,24 +443,7 @@ func WithVolumePath(volPath string) RuntimeOption {
 		}
 
 		rt.config.Engine.VolumePath = volPath
-		rt.config.Engine.VolumePathSet = true
-
-		return nil
-	}
-}
-
-// WithDefaultInfraImage sets the infra image for libpod.
-// An infra image is used for inter-container kernel
-// namespace sharing within a pod. Typically, an infra
-// container is lightweight and is there to reap
-// zombie processes within its pid namespace.
-func WithDefaultInfraImage(img string) RuntimeOption {
-	return func(rt *Runtime) error {
-		if rt.valid {
-			return define.ErrRuntimeFinalized
-		}
-
-		rt.config.Engine.InfraImage = img
+		rt.storageSet.VolumePathSet = true
 
 		return nil
 	}
@@ -483,23 +463,24 @@ func WithDefaultInfraCommand(cmd string) RuntimeOption {
 	}
 }
 
-// WithDefaultInfraName sets the infra container name for a single pod.
-func WithDefaultInfraName(name string) RuntimeOption {
+// WithReset tells Libpod that the runtime will be used to perform a system
+// reset. A number of checks at initialization are relaxed as the runtime is
+// going to be used to remove all containers, pods, volumes, images, and
+// networks.
+func WithReset() RuntimeOption {
 	return func(rt *Runtime) error {
 		if rt.valid {
 			return define.ErrRuntimeFinalized
 		}
 
-		rt.config.Engine.InfraImage = name
+		rt.doReset = true
 
 		return nil
 	}
 }
 
-// WithRenumber instructs libpod to perform a lock renumbering while
-// initializing. This will handle migrations from early versions of libpod with
-// file locks to newer versions with SHM locking, as well as changes in the
-// number of configured locks.
+// WithRenumber tells Libpod that the runtime will be used to perform a system
+// renumber. A number of checks on initialization related to locks are relaxed.
 func WithRenumber() RuntimeOption {
 	return func(rt *Runtime) error {
 		if rt.valid {
@@ -507,43 +488,6 @@ func WithRenumber() RuntimeOption {
 		}
 
 		rt.doRenumber = true
-
-		return nil
-	}
-}
-
-// WithMigrate instructs libpod to migrate container configurations to account
-// for changes between Engine versions. All running containers will be stopped
-// during a migration, then restarted after the migration is complete.
-func WithMigrate() RuntimeOption {
-	return func(rt *Runtime) error {
-		if rt.valid {
-			return define.ErrRuntimeFinalized
-		}
-
-		rt.doMigrate = true
-
-		return nil
-	}
-}
-
-// WithMigrateRuntime instructs Engine to change the default OCI runtime on all
-// containers during a migration. This is not used if `MigrateRuntime()` is not
-// also passed.
-// Engine makes no promises that your containers continue to work with the new
-// runtime - migrations between dissimilar runtimes may well break things.
-// Use with caution.
-func WithMigrateRuntime(requestedRuntime string) RuntimeOption {
-	return func(rt *Runtime) error {
-		if rt.valid {
-			return define.ErrRuntimeFinalized
-		}
-
-		if requestedRuntime == "" {
-			return errors.Wrapf(define.ErrInvalidArg, "must provide a non-empty name for new runtime")
-		}
-
-		rt.migrateRuntime = requestedRuntime
 
 		return nil
 	}
@@ -559,12 +503,10 @@ func WithEventsLogger(logger string) RuntimeOption {
 		}
 
 		if !events.IsValidEventer(logger) {
-			return errors.Wrapf(define.ErrInvalidArg, "%q is not a valid events backend", logger)
+			return fmt.Errorf("%q is not a valid events backend: %w", logger, define.ErrInvalidArg)
 		}
 
 		rt.config.Engine.EventsLogger = logger
-		rt.config.Engine.EventsLogFilePath = filepath.Join(rt.config.Engine.TmpDir, "events", "events.log")
-
 		return nil
 	}
 }
@@ -574,6 +516,14 @@ func WithEventsLogger(logger string) RuntimeOption {
 func WithEnableSDNotify() RuntimeOption {
 	return func(rt *Runtime) error {
 		rt.config.Engine.SDNotify = true
+		return nil
+	}
+}
+
+// WithSyslog sets a runtime option so we know that we have to log to the syslog as well
+func WithSyslog() RuntimeOption {
+	return func(rt *Runtime) error {
+		rt.syslog = true
 		return nil
 	}
 }
@@ -616,6 +566,30 @@ func WithShmDir(dir string) CtrCreateOption {
 	}
 }
 
+// WithNoShm tells libpod whether to mount /dev/shm
+func WithNoShm(mount bool) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+
+		ctr.config.NoShm = mount
+		return nil
+	}
+}
+
+// WithNoShmShare tells libpod whether to share containers /dev/shm with other containers
+func WithNoShmShare(share bool) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+
+		ctr.config.NoShmShare = share
+		return nil
+	}
+}
+
 // WithSystemd turns on systemd mode in the container
 func WithSystemd() CtrCreateOption {
 	return func(ctr *Container) error {
@@ -623,7 +597,19 @@ func WithSystemd() CtrCreateOption {
 			return define.ErrCtrFinalized
 		}
 
-		ctr.config.Systemd = true
+		t := true
+		ctr.config.Systemd = &t
+		return nil
+	}
+}
+
+// WithSdNotifySocket sets the sd-notify of the container
+func WithSdNotifySocket(socketPath string) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+		ctr.config.SdNotifySocket = socketPath
 		return nil
 	}
 }
@@ -635,9 +621,8 @@ func WithSdNotifyMode(mode string) CtrCreateOption {
 			return define.ErrCtrFinalized
 		}
 
-		// verify values
-		if len(mode) > 0 && !util.StringInSlice(strings.ToLower(mode), SdNotifyModeValues) {
-			return errors.Wrapf(define.ErrInvalidArg, "--sdnotify values must be one of %q", strings.Join(SdNotifyModeValues, ", "))
+		if err := define.ValidateSdNotifyMode(mode); err != nil {
+			return err
 		}
 
 		ctr.config.SdNotifyMode = mode
@@ -657,6 +642,23 @@ func WithShmSize(size int64) CtrCreateOption {
 	}
 }
 
+// WithShmSizeSystemd sets the size of systemd-specific mounts:
+//
+//	/run
+//	/run/lock
+//	/var/log/journal
+//	/tmp
+func WithShmSizeSystemd(size int64) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+
+		ctr.config.ShmSizeSystemd = size
+		return nil
+	}
+}
+
 // WithPrivileged sets the privileged flag in the container runtime.
 func WithPrivileged(privileged bool) CtrCreateOption {
 	return func(ctr *Container) error {
@@ -665,6 +667,19 @@ func WithPrivileged(privileged bool) CtrCreateOption {
 		}
 
 		ctr.config.Privileged = privileged
+		return nil
+	}
+}
+
+// WithReadWriteTmpfs sets up read-write tmpfs flag in the container runtime.
+// Only Used if containers are run in ReadOnly mode.
+func WithReadWriteTmpfs(readWriteTmpfs bool) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+
+		ctr.config.ReadWriteTmpfs = readWriteTmpfs
 		return nil
 	}
 }
@@ -766,6 +781,7 @@ func WithName(name string) CtrCreateOption {
 			return define.ErrCtrFinalized
 		}
 
+		name = strings.TrimPrefix(name, "/")
 		// Check the name against a regex
 		if !define.NameRegex.MatchString(name) {
 			return define.RegexError
@@ -785,9 +801,9 @@ func WithStopSignal(signal syscall.Signal) CtrCreateOption {
 		}
 
 		if signal == 0 {
-			return errors.Wrapf(define.ErrInvalidArg, "stop signal cannot be 0")
+			return fmt.Errorf("stop signal cannot be 0: %w", define.ErrInvalidArg)
 		} else if signal > 64 {
-			return errors.Wrapf(define.ErrInvalidArg, "stop signal cannot be greater than 64 (SIGRTMAX)")
+			return fmt.Errorf("stop signal cannot be greater than 64 (SIGRTMAX): %w", define.ErrInvalidArg)
 		}
 
 		ctr.config.StopSignal = uint(signal)
@@ -816,7 +832,6 @@ func WithTimeout(timeout uint) CtrCreateOption {
 		if ctr.valid {
 			return define.ErrCtrFinalized
 		}
-
 		ctr.config.Timeout = timeout
 
 		return nil
@@ -835,21 +850,7 @@ func WithIDMappings(idmappings storage.IDMappingOptions) CtrCreateOption {
 	}
 }
 
-// WithExitCommand sets the ExitCommand for the container, appending on the ctr.ID() to the end
-func WithExitCommand(exitCommand []string) CtrCreateOption {
-	return func(ctr *Container) error {
-		if ctr.valid {
-			return define.ErrCtrFinalized
-		}
-
-		ctr.config.ExitCommand = exitCommand
-		ctr.config.ExitCommand = append(ctr.config.ExitCommand, ctr.ID())
-
-		return nil
-	}
-}
-
-// WithUTSNSFromPod indicates the the container should join the UTS namespace of
+// WithUTSNSFromPod indicates that the container should join the UTS namespace of
 // its pod
 func WithUTSNSFromPod(p *Pod) CtrCreateOption {
 	return func(ctr *Container) error {
@@ -871,7 +872,7 @@ func WithUTSNSFromPod(p *Pod) CtrCreateOption {
 	}
 }
 
-// WithIPCNSFrom indicates the the container should join the IPC namespace of
+// WithIPCNSFrom indicates that the container should join the IPC namespace of
 // the given container.
 // If the container has joined a pod, it can only join the namespaces of
 // containers in the same pod.
@@ -891,7 +892,7 @@ func WithIPCNSFrom(nsCtr *Container) CtrCreateOption {
 	}
 }
 
-// WithMountNSFrom indicates the the container should join the mount namespace
+// WithMountNSFrom indicates that the container should join the mount namespace
 // of the given container.
 // If the container has joined a pod, it can only join the namespaces of
 // containers in the same pod.
@@ -910,7 +911,7 @@ func WithMountNSFrom(nsCtr *Container) CtrCreateOption {
 	}
 }
 
-// WithNetNSFrom indicates the the container should join the network namespace
+// WithNetNSFrom indicates that the container should join the network namespace
 // of the given container.
 // If the container has joined a pod, it can only join the namespaces of
 // containers in the same pod.
@@ -930,7 +931,7 @@ func WithNetNSFrom(nsCtr *Container) CtrCreateOption {
 	}
 }
 
-// WithPIDNSFrom indicates the the container should join the PID namespace of
+// WithPIDNSFrom indicates that the container should join the PID namespace of
 // the given container.
 // If the container has joined a pod, it can only join the namespaces of
 // containers in the same pod.
@@ -964,7 +965,7 @@ func WithAddCurrentUserPasswdEntry() CtrCreateOption {
 	}
 }
 
-// WithUserNSFrom indicates the the container should join the user namespace of
+// WithUserNSFrom indicates that the container should join the user namespace of
 // the given container.
 // If the container has joined a pod, it can only join the namespaces of
 // containers in the same pod.
@@ -982,6 +983,8 @@ func WithUserNSFrom(nsCtr *Container) CtrCreateOption {
 		if err := JSONDeepCopy(nsCtr.IDMappings(), &ctr.config.IDMappings); err != nil {
 			return err
 		}
+		// NewFromSpec() is deprecated according to its comment
+		// however the recommended replace just causes a nil map panic
 		g := generate.NewFromSpec(ctr.config.Spec)
 
 		g.ClearLinuxUIDMappings()
@@ -996,7 +999,7 @@ func WithUserNSFrom(nsCtr *Container) CtrCreateOption {
 	}
 }
 
-// WithUTSNSFrom indicates the the container should join the UTS namespace of
+// WithUTSNSFrom indicates that the container should join the UTS namespace of
 // the given container.
 // If the container has joined a pod, it can only join the namespaces of
 // containers in the same pod.
@@ -1016,7 +1019,7 @@ func WithUTSNSFrom(nsCtr *Container) CtrCreateOption {
 	}
 }
 
-// WithCgroupNSFrom indicates the the container should join the CGroup namespace
+// WithCgroupNSFrom indicates that the container should join the Cgroup namespace
 // of the given container.
 // If the container has joined a pod, it can only join the namespaces of
 // containers in the same pod.
@@ -1064,7 +1067,7 @@ func WithDependencyCtrs(ctrs []*Container) CtrCreateOption {
 // namespace with a minimal configuration.
 // An optional array of port mappings can be provided.
 // Conflicts with WithNetNSFrom().
-func WithNetNS(portMappings []nettypes.PortMapping, exposedPorts map[uint16][]string, postConfigureNetNS bool, netmode string, networks []string) CtrCreateOption {
+func WithNetNS(portMappings []nettypes.PortMapping, postConfigureNetNS bool, netmode string, networks map[string]nettypes.PerNetworkOptions) CtrCreateOption {
 	return func(ctr *Container) error {
 		if ctr.valid {
 			return define.ErrCtrFinalized
@@ -1074,26 +1077,25 @@ func WithNetNS(portMappings []nettypes.PortMapping, exposedPorts map[uint16][]st
 		ctr.config.NetMode = namespaces.NetworkMode(netmode)
 		ctr.config.CreateNetNS = true
 		ctr.config.PortMappings = portMappings
-		ctr.config.ExposedPorts = exposedPorts
 
+		if !ctr.config.NetMode.IsBridge() && len(networks) > 0 {
+			return errors.New("cannot use networks when network mode is not bridge")
+		}
 		ctr.config.Networks = networks
 
 		return nil
 	}
 }
 
-// WithStaticIP indicates that the container should request a static IP from
-// the CNI plugins.
-// It cannot be set unless WithNetNS has already been passed.
-// Further, it cannot be set if additional CNI networks to join have been
-// specified.
-func WithStaticIP(ip net.IP) CtrCreateOption {
+// WithExposedPorts includes a set of ports that were exposed by the image in
+// the container config, e.g. for display when the container is inspected.
+func WithExposedPorts(exposedPorts map[uint16][]string) CtrCreateOption {
 	return func(ctr *Container) error {
 		if ctr.valid {
 			return define.ErrCtrFinalized
 		}
 
-		ctr.config.StaticIP = ip
+		ctr.config.ExposedPorts = exposedPorts
 
 		return nil
 	}
@@ -1112,23 +1114,6 @@ func WithNetworkOptions(options map[string][]string) CtrCreateOption {
 	}
 }
 
-// WithStaticMAC indicates that the container should request a static MAC from
-// the CNI plugins.
-// It cannot be set unless WithNetNS has already been passed.
-// Further, it cannot be set if additional CNI networks to join have been
-// specified.
-func WithStaticMAC(mac nettypes.HardwareAddr) CtrCreateOption {
-	return func(ctr *Container) error {
-		if ctr.valid {
-			return define.ErrCtrFinalized
-		}
-
-		ctr.config.StaticMAC = mac
-
-		return nil
-	}
-}
-
 // WithLogDriver sets the log driver for the container
 func WithLogDriver(driver string) CtrCreateOption {
 	return func(ctr *Container) error {
@@ -1137,11 +1122,11 @@ func WithLogDriver(driver string) CtrCreateOption {
 		}
 		switch driver {
 		case "":
-			return errors.Wrapf(define.ErrInvalidArg, "log driver must be set")
-		case define.JournaldLogging, define.KubernetesLogging, define.JSONLogging, define.NoLogging, define.PassthroughLogging:
+			return fmt.Errorf("log driver must be set: %w", define.ErrInvalidArg)
+		case define.JournaldLogging, define.KubernetesLogging, define.JSONLogging, define.NoLogging, define.PassthroughLogging, define.PassthroughTTYLogging:
 			break
 		default:
-			return errors.Wrapf(define.ErrInvalidArg, "invalid log driver")
+			return fmt.Errorf("invalid log driver: %w", define.ErrInvalidArg)
 		}
 
 		ctr.config.LogDriver = driver
@@ -1157,7 +1142,7 @@ func WithLogPath(path string) CtrCreateOption {
 			return define.ErrCtrFinalized
 		}
 		if path == "" {
-			return errors.Wrapf(define.ErrInvalidArg, "log path must be set")
+			return fmt.Errorf("log path must be set: %w", define.ErrInvalidArg)
 		}
 
 		ctr.config.LogPath = path
@@ -1173,7 +1158,7 @@ func WithLogTag(tag string) CtrCreateOption {
 			return define.ErrCtrFinalized
 		}
 		if tag == "" {
-			return errors.Wrapf(define.ErrInvalidArg, "log tag must be set")
+			return fmt.Errorf("log tag must be set: %w", define.ErrInvalidArg)
 		}
 
 		ctr.config.LogTag = tag
@@ -1182,7 +1167,7 @@ func WithLogTag(tag string) CtrCreateOption {
 	}
 }
 
-// WithCgroupsMode disables the creation of CGroups for the conmon process.
+// WithCgroupsMode disables the creation of Cgroups for the conmon process.
 func WithCgroupsMode(mode string) CtrCreateOption {
 	return func(ctr *Container) error {
 		if ctr.valid {
@@ -1196,7 +1181,7 @@ func WithCgroupsMode(mode string) CtrCreateOption {
 		case "enabled", "no-conmon", cgroupSplit:
 			ctr.config.CgroupsMode = mode
 		default:
-			return errors.Wrapf(define.ErrInvalidArg, "Invalid cgroup mode %q", mode)
+			return fmt.Errorf("invalid cgroup mode %q: %w", mode, define.ErrInvalidArg)
 		}
 
 		return nil
@@ -1211,7 +1196,7 @@ func WithCgroupParent(parent string) CtrCreateOption {
 		}
 
 		if parent == "" {
-			return errors.Wrapf(define.ErrInvalidArg, "cgroup parent cannot be empty")
+			return fmt.Errorf("cgroup parent cannot be empty: %w", define.ErrInvalidArg)
 		}
 
 		ctr.config.CgroupParent = parent
@@ -1241,7 +1226,7 @@ func WithDNS(dnsServers []string) CtrCreateOption {
 		for _, i := range dnsServers {
 			result := net.ParseIP(i)
 			if result == nil {
-				return errors.Wrapf(define.ErrInvalidArg, "invalid IP address %s", i)
+				return fmt.Errorf("invalid IP address %s: %w", i, define.ErrInvalidArg)
 			}
 			dns = append(dns, result)
 		}
@@ -1251,14 +1236,14 @@ func WithDNS(dnsServers []string) CtrCreateOption {
 	}
 }
 
-// WithDNSOption sets addition dns options for the container.
+// WithDNSOption sets additional dns options for the container.
 func WithDNSOption(dnsOptions []string) CtrCreateOption {
 	return func(ctr *Container) error {
 		if ctr.valid {
 			return define.ErrCtrFinalized
 		}
 		if ctr.config.UseImageResolvConf {
-			return errors.Wrapf(define.ErrInvalidArg, "cannot add DNS options if container will not create /etc/resolv.conf")
+			return fmt.Errorf("cannot add DNS options if container will not create /etc/resolv.conf: %w", define.ErrInvalidArg)
 		}
 		ctr.config.DNSOption = append(ctr.config.DNSOption, dnsOptions...)
 		return nil
@@ -1361,16 +1346,17 @@ func WithCommand(command []string) CtrCreateOption {
 
 // WithRootFS sets the rootfs for the container.
 // This creates a container from a directory on disk and not an image.
-func WithRootFS(rootfs string, overlay bool) CtrCreateOption {
+func WithRootFS(rootfs string, overlay bool, mapping *string) CtrCreateOption {
 	return func(ctr *Container) error {
 		if ctr.valid {
 			return define.ErrCtrFinalized
 		}
-		if _, err := os.Stat(rootfs); err != nil {
+		if err := fileutils.Exists(rootfs); err != nil {
 			return err
 		}
 		ctr.config.Rootfs = rootfs
 		ctr.config.RootfsOverlay = overlay
+		ctr.config.RootfsMapping = mapping
 		return nil
 	}
 }
@@ -1428,12 +1414,11 @@ func WithRestartPolicy(policy string) CtrCreateOption {
 			return define.ErrCtrFinalized
 		}
 
-		switch policy {
-		case define.RestartPolicyNone, define.RestartPolicyNo, define.RestartPolicyOnFailure, define.RestartPolicyAlways, define.RestartPolicyUnlessStopped:
-			ctr.config.RestartPolicy = policy
-		default:
-			return errors.Wrapf(define.ErrInvalidArg, "%q is not a valid restart policy", policy)
+		if err := define.ValidateRestartPolicy(policy); err != nil {
+			return err
 		}
+
+		ctr.config.RestartPolicy = policy
 
 		return nil
 	}
@@ -1464,13 +1449,15 @@ func WithNamedVolumes(volumes []*ContainerNamedVolume) CtrCreateOption {
 		for _, vol := range volumes {
 			mountOpts, err := util.ProcessOptions(vol.Options, false, "")
 			if err != nil {
-				return errors.Wrapf(err, "processing options for named volume %q mounted at %q", vol.Name, vol.Dest)
+				return fmt.Errorf("processing options for named volume %q mounted at %q: %w", vol.Name, vol.Dest, err)
 			}
 
 			ctr.config.NamedVolumes = append(ctr.config.NamedVolumes, &ContainerNamedVolume{
-				Name:    vol.Name,
-				Dest:    vol.Dest,
-				Options: mountOpts,
+				Name:        vol.Name,
+				Dest:        vol.Dest,
+				Options:     mountOpts,
+				IsAnonymous: vol.IsAnonymous,
+				SubPath:     vol.SubPath,
 			})
 		}
 
@@ -1509,6 +1496,7 @@ func WithImageVolumes(volumes []*ContainerImageVolume) CtrCreateOption {
 				Dest:      vol.Dest,
 				Source:    vol.Source,
 				ReadWrite: vol.ReadWrite,
+				SubPath:   vol.SubPath,
 			})
 		}
 
@@ -1527,6 +1515,68 @@ func WithHealthCheck(healthCheck *manifest.Schema2HealthConfig) CtrCreateOption 
 	}
 }
 
+// WithHealthCheckLogDestination adds the healthLogDestination to the container config
+func WithHealthCheckLogDestination(destination string) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+		switch destination {
+		case define.HealthCheckEventsLoggerDestination, define.DefaultHealthCheckLocalDestination:
+			ctr.config.HealthLogDestination = destination
+		default:
+			fileInfo, err := os.Stat(destination)
+			if err != nil {
+				return fmt.Errorf("HealthCheck Log '%s' destination error: %w", destination, err)
+			}
+			mode := fileInfo.Mode()
+			if !mode.IsDir() {
+				return fmt.Errorf("HealthCheck Log '%s' destination must be directory", destination)
+			}
+
+			absPath, err := filepath.Abs(destination)
+			if err != nil {
+				return err
+			}
+			ctr.config.HealthLogDestination = absPath
+		}
+		return nil
+	}
+}
+
+// WithHealthCheckMaxLogCount adds the healthMaxLogCount to the container config
+func WithHealthCheckMaxLogCount(maxLogCount uint) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+		ctr.config.HealthMaxLogCount = maxLogCount
+		return nil
+	}
+}
+
+// WithHealthCheckMaxLogSize adds the healthMaxLogSize to the container config
+func WithHealthCheckMaxLogSize(maxLogSize uint) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+		ctr.config.HealthMaxLogSize = maxLogSize
+		return nil
+	}
+}
+
+// WithHealthCheckOnFailureAction adds an on-failure action to health-check config
+func WithHealthCheckOnFailureAction(action define.HealthCheckOnFailureAction) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+		ctr.config.HealthCheckOnFailureAction = action
+		return nil
+	}
+}
+
 // WithPreserveFDs forwards from the process running Libpod into the container
 // the given number of extra FDs (starting after the standard streams) to the created container
 func WithPreserveFDs(fd uint) CtrCreateOption {
@@ -1535,6 +1585,18 @@ func WithPreserveFDs(fd uint) CtrCreateOption {
 			return define.ErrCtrFinalized
 		}
 		ctr.config.PreserveFDs = fd
+		return nil
+	}
+}
+
+// WithPreserveFD forwards from the process running Libpod into the container
+// the given list of extra FDs to the created container
+func WithPreserveFD(fds []uint) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+		ctr.config.PreserveFD = fds
 		return nil
 	}
 }
@@ -1551,7 +1613,7 @@ func WithCreateCommand(cmd []string) CtrCreateOption {
 	}
 }
 
-// withIsInfra allows us to dfferentiate between infra containers and regular containers
+// withIsInfra allows us to differentiate between infra containers and other containers
 // within the container config
 func withIsInfra() CtrCreateOption {
 	return func(ctr *Container) error {
@@ -1561,6 +1623,21 @@ func withIsInfra() CtrCreateOption {
 
 		ctr.config.IsInfra = true
 
+		return nil
+	}
+}
+
+// WithIsService allows us to differentiate between service containers and other container
+// within the container config.  It also sets the exit-code propagation of the
+// service container.
+func WithIsService(ecp define.KubeExitCodePropagation) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+
+		ctr.config.IsService = true
+		ctr.config.KubeExitCodePropagation = ecp
 		return nil
 	}
 }
@@ -1578,21 +1655,18 @@ func WithCreateWorkingDir() CtrCreateOption {
 	}
 }
 
-// WithNetworkAliases sets network aliases for the container.
-// Accepts a map of network name to aliases.
-func WithNetworkAliases(aliases map[string][]string) CtrCreateOption {
-	return func(ctr *Container) error {
-		if ctr.valid {
-			return define.ErrCtrFinalized
-		}
+// Volume Creation Options
 
-		ctr.config.NetworkAliases = aliases
+func WithVolumeIgnoreIfExist() VolumeCreateOption {
+	return func(volume *Volume) error {
+		if volume.valid {
+			return define.ErrVolumeFinalized
+		}
+		volume.ignoreIfExists = true
 
 		return nil
 	}
 }
-
-// Volume Creation Options
 
 // WithVolumeName sets the name of the volume.
 func WithVolumeName(name string) VolumeCreateOption {
@@ -1637,6 +1711,18 @@ func WithVolumeLabels(labels map[string]string) VolumeCreateOption {
 			volume.config.Labels[key] = value
 		}
 
+		return nil
+	}
+}
+
+// WithVolumeMountLabel sets the MountLabel of the volume.
+func WithVolumeMountLabel(mountLabel string) VolumeCreateOption {
+	return func(volume *Volume) error {
+		if volume.valid {
+			return define.ErrVolumeFinalized
+		}
+
+		volume.config.MountLabel = mountLabel
 		return nil
 	}
 }
@@ -1722,6 +1808,19 @@ func WithVolumeNoChown() VolumeCreateOption {
 	}
 }
 
+// WithVolumeDisableQuota prevents the volume from being assigned a quota.
+func WithVolumeDisableQuota() VolumeCreateOption {
+	return func(volume *Volume) error {
+		if volume.valid {
+			return define.ErrVolumeFinalized
+		}
+
+		volume.config.DisableQuota = true
+
+		return nil
+	}
+}
+
 // withSetAnon sets a bool notifying libpod that this volume is anonymous and
 // should be removed when containers using it are removed and volumes are
 // specified for removal.
@@ -1737,6 +1836,26 @@ func withSetAnon() VolumeCreateOption {
 	}
 }
 
+// WithVolumeDriverTimeout sets the volume creation timeout period.
+// Only usable if a non-local volume driver is in use.
+func WithVolumeDriverTimeout(timeout uint) VolumeCreateOption {
+	return func(volume *Volume) error {
+		if volume.valid {
+			return define.ErrVolumeFinalized
+		}
+
+		if volume.config.Driver == "" || volume.config.Driver == define.VolumeDriverLocal {
+			return fmt.Errorf("Volume driver timeout can only be used with non-local volume drivers: %w", define.ErrInvalidArg)
+		}
+
+		tm := timeout
+
+		volume.config.Timeout = &tm
+
+		return nil
+	}
+}
+
 // WithTimezone sets the timezone in the container
 func WithTimezone(path string) CtrCreateOption {
 	return func(ctr *Container) error {
@@ -1744,15 +1863,10 @@ func WithTimezone(path string) CtrCreateOption {
 			return define.ErrCtrFinalized
 		}
 		if path != "local" {
-			zone := filepath.Join("/usr/share/zoneinfo", path)
-
-			file, err := os.Stat(zone)
+			// validate the format of the timezone specified if it's not "local"
+			_, err := time.LoadLocation(path)
 			if err != nil {
-				return err
-			}
-			//We don't want to mount a timezone directory
-			if file.IsDir() {
-				return errors.New("Invalid timezone: is a directory")
+				return fmt.Errorf("finding timezone: %w", err)
 			}
 		}
 
@@ -1767,8 +1881,8 @@ func WithUmask(umask string) CtrCreateOption {
 		if ctr.valid {
 			return define.ErrCtrFinalized
 		}
-		if !define.UmaskRegex.MatchString(umask) {
-			return errors.Wrapf(define.ErrInvalidArg, "Invalid umask string %s", umask)
+		if !umaskRegex.MatchString(umask) {
+			return fmt.Errorf("invalid umask string %s: %w", umask, define.ErrInvalidArg)
 		}
 		ctr.config.Umask = umask
 		return nil
@@ -1786,7 +1900,7 @@ func WithSecrets(containerSecrets []*ContainerSecret) CtrCreateOption {
 	}
 }
 
-// WithSecrets adds environment variable secrets to the container
+// WithEnvSecrets adds environment variable secrets to the container
 func WithEnvSecrets(envSecrets map[string]string) CtrCreateOption {
 	return func(ctr *Container) error {
 		ctr.config.EnvSecrets = make(map[string]*secrets.Secret)
@@ -1819,7 +1933,18 @@ func WithPidFile(pidFile string) CtrCreateOption {
 	}
 }
 
-// WithInitCtrType indicates the container is a initcontainer
+// WithHostUsers indicates host users to add to /etc/passwd
+func WithHostUsers(hostUsers []string) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+		ctr.config.HostUsers = hostUsers
+		return nil
+	}
+}
+
+// WithInitCtrType indicates the container is an initcontainer
 func WithInitCtrType(containerType string) CtrCreateOption {
 	return func(ctr *Container) error {
 		if ctr.valid {
@@ -1830,7 +1955,7 @@ func WithInitCtrType(containerType string) CtrCreateOption {
 			ctr.config.InitContainerType = containerType
 			return nil
 		}
-		return errors.Errorf("%s is invalid init container type", containerType)
+		return fmt.Errorf("%s is invalid init container type", containerType)
 	}
 }
 
@@ -1841,6 +1966,51 @@ func WithHostDevice(dev []specs.LinuxDevice) CtrCreateOption {
 			return define.ErrCtrFinalized
 		}
 		ctr.config.DeviceHostSrc = dev
+		return nil
+	}
+}
+
+// WithSelectedPasswordManagement makes it so that the container either does or does not set up /etc/passwd or /etc/group
+func WithSelectedPasswordManagement(passwd *bool) CtrCreateOption {
+	return func(c *Container) error {
+		if c.valid {
+			return define.ErrCtrFinalized
+		}
+		c.config.Passwd = passwd
+		return nil
+	}
+}
+
+// WithInfraConfig allows for inheritance of compatible config entities from the infra container
+func WithInfraConfig(compatibleOptions InfraInherit) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+		compatMarshal, err := json.Marshal(compatibleOptions)
+		if err != nil {
+			return errors.New("could not marshal compatible options")
+		}
+
+		err = json.Unmarshal(compatMarshal, ctr.config)
+		if err != nil {
+			return errors.New("could not unmarshal compatible options into container config")
+		}
+		return nil
+	}
+}
+
+// WithStartupHealthcheck sets a startup healthcheck for the container.
+// Requires that a healthcheck must be set.
+func WithStartupHealthcheck(startupHC *define.StartupHealthCheck) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+		ctr.config.StartupHealthCheckConfig = new(define.StartupHealthCheck)
+		if err := JSONDeepCopy(startupHC, ctr.config.StartupHealthCheckConfig); err != nil {
+			return fmt.Errorf("error copying startup healthcheck into container: %w", err)
+		}
 		return nil
 	}
 }
@@ -1872,6 +2042,58 @@ func WithPodName(name string) PodCreateOption {
 		}
 
 		pod.config.Name = name
+
+		return nil
+	}
+}
+
+// WithPodExitPolicy sets the exit policy of the pod.
+func WithPodExitPolicy(policy string) PodCreateOption {
+	return func(pod *Pod) error {
+		if pod.valid {
+			return define.ErrPodFinalized
+		}
+
+		parsed, err := config.ParsePodExitPolicy(policy)
+		if err != nil {
+			return err
+		}
+
+		pod.config.ExitPolicy = parsed
+
+		return nil
+	}
+}
+
+// WithPodRestartPolicy sets the restart policy of the pod.
+func WithPodRestartPolicy(policy string) PodCreateOption {
+	return func(pod *Pod) error {
+		if pod.valid {
+			return define.ErrPodFinalized
+		}
+
+		switch policy {
+		//TODO: v5.0 if no restart policy is set, follow k8s convention and default to Always
+		case define.RestartPolicyNone, define.RestartPolicyNo, define.RestartPolicyOnFailure, define.RestartPolicyAlways, define.RestartPolicyUnlessStopped:
+			pod.config.RestartPolicy = policy
+		default:
+			return fmt.Errorf("%q is not a valid restart policy: %w", policy, define.ErrInvalidArg)
+		}
+
+		return nil
+	}
+}
+
+// WithPodRestartRetries sets the number of retries to use when restarting a
+// container with the "on-failure" restart policy.
+// 0 is an allowed value, and indicates infinite retries.
+func WithPodRestartRetries(tries uint) PodCreateOption {
+	return func(pod *Pod) error {
+		if pod.valid {
+			return define.ErrPodFinalized
+		}
+
+		pod.config.RestartRetries = &tries
 
 		return nil
 	}
@@ -1936,11 +2158,11 @@ func WithPodCgroupParent(path string) PodCreateOption {
 	}
 }
 
-// WithPodCgroups tells containers in this pod to use the cgroup created for
+// WithPodParent tells containers in this pod to use the cgroup created for
 // this pod.
 // This can still be overridden at the container level by explicitly specifying
-// a CGroup parent.
-func WithPodCgroups() PodCreateOption {
+// a Cgroup parent.
+func WithPodParent() PodCreateOption {
 	return func(pod *Pod) error {
 		if pod.valid {
 			return define.ErrPodFinalized
@@ -2097,6 +2319,39 @@ func WithInfraContainer() PodCreateOption {
 	}
 }
 
+// WithServiceContainer associates the specified service container ID with the pod.
+func WithServiceContainer(id string) PodCreateOption {
+	return func(pod *Pod) error {
+		if pod.valid {
+			return define.ErrPodFinalized
+		}
+
+		ctr, err := pod.runtime.LookupContainer(id)
+		if err != nil {
+			return fmt.Errorf("looking up service container: %w", err)
+		}
+
+		if err := ctr.addServicePodLocked(pod.ID()); err != nil {
+			return fmt.Errorf("associating service container %s with pod %s: %w", id, pod.ID(), err)
+		}
+
+		pod.config.ServiceContainerID = id
+		return nil
+	}
+}
+
+// WithPodResources sets resource limits to be applied to the pod's cgroup
+// these will be inherited by all containers unless overridden.
+func WithPodResources(resources specs.LinuxResources) PodCreateOption {
+	return func(pod *Pod) error {
+		if pod.valid {
+			return define.ErrPodFinalized
+		}
+		pod.config.ResourceLimits = resources
+		return nil
+	}
+}
+
 // WithVolatile sets the volatile flag for the container storage.
 // The option can potentially cause data loss when used on a container that must survive a machine reboot.
 func WithVolatile() CtrCreateOption {
@@ -2106,6 +2361,87 @@ func WithVolatile() CtrCreateOption {
 		}
 
 		ctr.config.Volatile = true
+
+		return nil
+	}
+}
+
+// WithChrootDirs is an additional set of directories that need to be
+// treated as root directories. Standard bind mounts will be mounted
+// into paths relative to these directories.
+func WithChrootDirs(dirs []string) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+
+		ctr.config.ChrootDirs = dirs
+
+		return nil
+	}
+}
+
+// WithPasswdEntry sets the entry to write to the /etc/passwd file.
+func WithPasswdEntry(passwdEntry string) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+
+		ctr.config.PasswdEntry = passwdEntry
+
+		return nil
+	}
+}
+
+// WithGroupEntry sets the entry to write to the /etc/group file.
+func WithGroupEntry(groupEntry string) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+
+		ctr.config.GroupEntry = groupEntry
+
+		return nil
+	}
+}
+
+// WithBaseHostsFile sets the option to copy /etc/hosts file.
+func WithBaseHostsFile(baseHostsFile string) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+
+		ctr.config.BaseHostsFile = baseHostsFile
+
+		return nil
+	}
+}
+
+// WithMountAllDevices sets the option to mount all of a privileged container's
+// host devices
+func WithMountAllDevices() CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+
+		ctr.config.MountAllDevices = true
+
+		return nil
+	}
+}
+
+// WithLabelNested sets the LabelNested flag allowing label separation within container
+func WithLabelNested(nested bool) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+
+		ctr.config.LabelNested = nested
 
 		return nil
 	}

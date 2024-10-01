@@ -1,13 +1,17 @@
+//go:build !remote
+
 package libpod
 
 import (
 	"net"
 	"time"
 
+	"github.com/containers/common/libnetwork/types"
 	"github.com/containers/common/pkg/secrets"
 	"github.com/containers/image/v5/manifest"
-	"github.com/containers/podman/v3/libpod/network/types"
-	"github.com/containers/podman/v3/pkg/namespaces"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/namespaces"
+	"github.com/containers/podman/v5/pkg/specgen"
 	"github.com/containers/storage"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 )
@@ -22,7 +26,7 @@ type ContainerConfig struct {
 	// in when the container is created, but it is not the final spec used
 	// to run the container - it will be modified by Libpod to add things we
 	// manage (e.g. bind mounts for /etc/resolv.conf, named volumes, a
-	// network namespace prepared by CNI or slirp4netns) in the
+	// network namespace prepared by the network backend) in the
 	// generateSpec() function.
 	Spec *spec.Spec `json:"spec"`
 
@@ -114,14 +118,22 @@ type ContainerRootFSConfig struct {
 	Rootfs string `json:"rootfs,omitempty"`
 	// RootfsOverlay tells if rootfs has to be mounted as an overlay
 	RootfsOverlay bool `json:"rootfs_overlay,omitempty"`
+	// RootfsMapping specifies if there are mappings to apply to the rootfs.
+	RootfsMapping *string `json:"rootfs_mapping,omitempty"`
 	// ShmDir is the path to be mounted on /dev/shm in container.
 	// If not set manually at creation time, Libpod will create a tmpfs
 	// with the size specified in ShmSize and populate this with the path of
 	// said tmpfs.
 	ShmDir string `json:"ShmDir,omitempty"`
+	// NoShmShare indicates whether /dev/shm can be shared with other containers
+	NoShmShare bool `json:"NOShmShare,omitempty"`
+	// NoShm indicates whether a tmpfs should be created and mounted on  /dev/shm
+	NoShm bool `json:"NoShm,omitempty"`
 	// ShmSize is the size of the container's SHM. Only used if ShmDir was
 	// not set manually at time of creation.
 	ShmSize int64 `json:"shmSize"`
+	// ShmSizeSystemd is the size of systemd-specific tmpfs mounts
+	ShmSizeSystemd int64 `json:"shmSizeSystemd"`
 	// Static directory for container content that will persist across
 	// reboot.
 	// StaticDir is a persistent directory for Libpod files that will
@@ -148,7 +160,7 @@ type ContainerRootFSConfig struct {
 	// pre-1.8, which was used in very old Podman versions to determine how
 	// image volumes were handled in Libpod (support for these eventually
 	// moved out of Libpod into pkg/specgen).
-	// Please DO NOT re-use the `imageVolumes` name in container JSON again.
+	// Please DO NOT reuse the `imageVolumes` name in container JSON again.
 	ImageVolumes []*ContainerImageVolume `json:"ctrImageVolumes,omitempty"`
 	// CreateWorkingDir indicates that Libpod should create the container's
 	// working directory if it does not exist. Some OCI runtimes do this by
@@ -163,6 +175,12 @@ type ContainerRootFSConfig struct {
 	// Volatile specifies whether the container storage can be optimized
 	// at the cost of not syncing all the dirty files in memory.
 	Volatile bool `json:"volatile,omitempty"`
+	// Passwd allows to user to override podman's passwd/group file setup
+	Passwd *bool `json:"passwd,omitempty"`
+	// ChrootDirs is an additional set of directories that need to be
+	// treated as root directories. Standard bind mounts will be mounted
+	// into paths relative to these directories.
+	ChrootDirs []string `json:"chroot_directories,omitempty"`
 }
 
 // ContainerSecurityConfig is an embedded sub-config providing security configuration
@@ -183,7 +201,7 @@ type ContainerSecurityConfig struct {
 	// If not explicitly set, an unused random MLS label will be assigned by
 	// containers/storage (but only if SELinux is enabled).
 	MountLabel string `json:"MountLabel,omitempty"`
-	// LabelOpts are options passed in by the user to setup SELinux labels.
+	// LabelOpts are options passed in by the user to set up SELinux labels.
 	// These are used by the containers/storage library.
 	LabelOpts []string `json:"labelopts,omitempty"`
 	// User and group to use in the container. Can be specified as only user
@@ -196,11 +214,15 @@ type ContainerSecurityConfig struct {
 	// Groups are additional groups to add the container's user to. These
 	// are resolved within the container using the container's /etc/passwd.
 	Groups []string `json:"groups,omitempty"`
+	// HostUsers are a list of host user accounts to add to /etc/passwd
+	HostUsers []string `json:"HostUsers,omitempty"`
 	// AddCurrentUserPasswdEntry indicates that Libpod should ensure that
 	// the container's /etc/passwd contains an entry for the user running
 	// Libpod - mostly used in rootless containers where the user running
 	// Libpod wants to retain their UID inside the container.
 	AddCurrentUserPasswdEntry bool `json:"addCurrentUserPasswdEntry,omitempty"`
+	// LabelNested, allow labeling separation from within a container
+	LabelNested bool `json:"label_nested"`
 }
 
 // ContainerNameSpaceConfig is an embedded sub-config providing
@@ -229,11 +251,13 @@ type ContainerNetworkConfig struct {
 	// StaticIP is a static IP to request for the container.
 	// This cannot be set unless CreateNetNS is set.
 	// If not set, the container will be dynamically assigned an IP by CNI.
-	StaticIP net.IP `json:"staticIP"`
+	// Deprecated: Do no use this anymore, this is only for DB backwards compat.
+	StaticIP net.IP `json:"staticIP,omitempty"`
 	// StaticMAC is a static MAC to request for the container.
 	// This cannot be set unless CreateNetNS is set.
 	// If not set, the container will be dynamically assigned a MAC by CNI.
-	StaticMAC types.HardwareAddr `json:"staticMAC"`
+	// Deprecated: Do no use this anymore, this is only for DB backwards compat.
+	StaticMAC types.HardwareAddr `json:"staticMAC,omitempty"`
 	// PortMappings are the ports forwarded to the container's network
 	// namespace
 	// These are not used unless CreateNetNS is true
@@ -266,27 +290,33 @@ type ContainerNetworkConfig struct {
 	// bind-mounted inside the container.
 	// Conflicts with HostAdd.
 	UseImageHosts bool
+	// BaseHostsFile is the path to a hosts file, the entries from this file
+	// are added to the containers hosts file. As special value "image" is
+	// allowed which uses the /etc/hosts file from within the image and "none"
+	// which uses no base file at all. If it is empty we should default
+	// to the base_hosts_file configuration in containers.conf.
+	BaseHostsFile string `json:"baseHostsFile,omitempty"`
 	// Hosts to add in container
 	// Will be appended to host's host file
 	HostAdd []string `json:"hostsAdd,omitempty"`
-	// Network names (CNI) to add container to. Empty to use default network.
+	// Network names with the network specific options.
+	// Please note that these can be altered at runtime. The actual list is
+	// stored in the DB and should be retrieved from there via c.networks()
+	// this value is only used for container create.
+	// Added in podman 4.0, previously NetworksDeprecated was used. Make
+	// sure to not change the json tags.
+	Networks map[string]types.PerNetworkOptions `json:"newNetworks,omitempty"`
+	// Network names to add container to. Empty to use default network.
 	// Please note that these can be altered at runtime. The actual list is
 	// stored in the DB and should be retrieved from there; this is only the
 	// set of networks the container was *created* with.
-	Networks []string `json:"networks,omitempty"`
+	// Deprecated: Do no use this anymore, this is only for DB backwards compat.
+	// Also note that we need to keep the old json tag to decode from DB correctly
+	NetworksDeprecated []string `json:"networks,omitempty"`
 	// Network mode specified for the default network.
 	NetMode namespaces.NetworkMode `json:"networkMode,omitempty"`
 	// NetworkOptions are additional options for each network
 	NetworkOptions map[string][]string `json:"network_options,omitempty"`
-	// NetworkAliases are aliases that will be added to each network.
-	// These are additional names that this container can be accessed as via
-	// DNS when the CNI dnsname plugin is in use.
-	// Please note that these can be altered at runtime. As such, the actual
-	// list is stored in the database and should be retrieved from there;
-	// this is only the set of aliases the container was *created with*.
-	// Formatted as map of network name to aliases. All network names must
-	// be present in the Networks list above.
-	NetworkAliases map[string][]string `json:"network_alises,omitempty"`
 }
 
 // ContainerImageConfig is an embedded sub-config providing image configuration
@@ -319,7 +349,7 @@ type ContainerMiscConfig struct {
 	Labels map[string]string `json:"labels,omitempty"`
 	// StopSignal is the signal that will be used to stop the container
 	StopSignal uint `json:"stopSignal,omitempty"`
-	// StopTimeout is the signal that will be used to stop the container
+	// StopTimeout is maximum time a container is allowed to run after getting the stop signal
 	StopTimeout uint `json:"stopTimeout,omitempty"`
 	// Timeout is maximum time a container will run before getting the kill signal
 	Timeout uint `json:"timeout,omitempty"`
@@ -328,7 +358,7 @@ type ContainerMiscConfig struct {
 	// CgroupManager is the cgroup manager used to create this container.
 	// If empty, the runtime default will be used.
 	CgroupManager string `json:"cgroupManager,omitempty"`
-	// NoCgroups indicates that the container will not create CGroups. It is
+	// NoCgroups indicates that the container will not create Cgroups. It is
 	// incompatible with CgroupParent.  Deprecated in favor of CgroupsMode.
 	NoCgroups bool `json:"noCgroups,omitempty"`
 	// CgroupsMode indicates how the container will create cgroups
@@ -336,6 +366,10 @@ type ContainerMiscConfig struct {
 	CgroupsMode string `json:"cgroupsMode,omitempty"`
 	// Cgroup parent of the container.
 	CgroupParent string `json:"cgroupParent"`
+	// GroupEntry specifies arbitrary data to append to a file.
+	GroupEntry string `json:"group_entry,omitempty"`
+	// KubeExitCodePropagation of the service container.
+	KubeExitCodePropagation define.KubeExitCodePropagation `json:"kubeExitCodePropagation"`
 	// LogPath log location
 	LogPath string `json:"logPath"`
 	// LogTag is the tag used for logging
@@ -349,7 +383,7 @@ type ContainerMiscConfig struct {
 	// RestartPolicy indicates what action the container will take upon
 	// exiting naturally.
 	// Allowed options are "no" (take no action), "on-failure" (restart on
-	// non-zero exit code, up an a maximum of RestartRetries times),
+	// non-zero exit code, up to a maximum of RestartRetries times),
 	// and "always" (always restart the container on any exit code).
 	// The empty string is treated as the default ("no")
 	RestartPolicy string `json:"restart_policy,omitempty"`
@@ -357,33 +391,47 @@ type ContainerMiscConfig struct {
 	// restart the container. Used only if RestartPolicy is set to
 	// "on-failure".
 	RestartRetries uint `json:"restart_retries,omitempty"`
-	// TODO log options for log drivers
 	// PostConfigureNetNS needed when a user namespace is created by an OCI runtime
 	// if the network namespace is created before the user namespace it will be
 	// owned by the wrong user namespace.
 	PostConfigureNetNS bool `json:"postConfigureNetNS"`
 	// OCIRuntime used to create the container
 	OCIRuntime string `json:"runtime,omitempty"`
-	// ExitCommand is the container's exit command.
-	// This Command will be executed when the container exits by Conmon.
-	// It is usually used to invoke post-run cleanup - for example, in
-	// Podman, it invokes `podman container cleanup`, which in turn calls
-	// Libpod's Cleanup() API to unmount the container and clean up its
-	// network.
-	ExitCommand []string `json:"exitCommand,omitempty"`
 	// IsInfra is a bool indicating whether this container is an infra container used for
 	// sharing kernel namespaces in a pod
 	IsInfra bool `json:"pause"`
+	// IsService is a bool indicating whether this container is a service container used for
+	// tracking the life cycle of K8s service.
+	IsService bool `json:"isService"`
 	// SdNotifyMode tells libpod what to do with a NOTIFY_SOCKET if passed
 	SdNotifyMode string `json:"sdnotifyMode,omitempty"`
-	// Systemd tells libpod to setup the container in systemd mode
-	Systemd bool `json:"systemd"`
+	// SdNotifySocket stores NOTIFY_SOCKET in use by the container
+	SdNotifySocket string `json:"sdnotifySocket,omitempty"`
+	// Systemd tells libpod to set up the container in systemd mode, a value of nil denotes false
+	Systemd *bool `json:"systemd,omitempty"`
 	// HealthCheckConfig has the health check command and related timings
 	HealthCheckConfig *manifest.Schema2HealthConfig `json:"healthcheck"`
+	// HealthCheckOnFailureAction defines an action to take once the container turns unhealthy.
+	HealthCheckOnFailureAction define.HealthCheckOnFailureAction `json:"healthcheck_on_failure_action"`
+	// HealthLogDestination defines the destination where the log is stored
+	HealthLogDestination string `json:"healthLogDestination,omitempty"`
+	// HealthMaxLogCount is maximum number of attempts in the HealthCheck log file.
+	// ('0' value means an infinite number of attempts in the log file)
+	HealthMaxLogCount uint `json:"healthMaxLogCount,omitempty"`
+	// HealthMaxLogSize is the maximum length in characters of stored HealthCheck log
+	// ("0" value means an infinite log length)
+	HealthMaxLogSize uint `json:"healthMaxLogSize,omitempty"`
+	// StartupHealthCheckConfig is the configuration of the startup
+	// healthcheck for the container. This will run before the regular HC
+	// runs, and when it passes the regular HC will be activated.
+	StartupHealthCheckConfig *define.StartupHealthCheck `json:"startupHealthCheck,omitempty"`
 	// PreserveFDs is a number of additional file descriptors (in addition
 	// to 0, 1, 2) that will be passed to the executed process. The total FDs
 	// passed will be 3 + PreserveFDs.
 	PreserveFDs uint `json:"preserveFds,omitempty"`
+	// PreserveFD is a list of additional file descriptors (in addition
+	// to 0, 1, 2) that will be passed to the executed process.
+	PreserveFD []uint `json:"preserveFd,omitempty"`
 	// Timezone is the timezone inside the container.
 	// Local means it has the same timezone as the host machine
 	Timezone string `json:"timezone,omitempty"`
@@ -400,4 +448,34 @@ type ContainerMiscConfig struct {
 	// InitContainerType specifies if the container is an initcontainer
 	// and if so, what type: always or once are possible non-nil entries
 	InitContainerType string `json:"init_container_type,omitempty"`
+	// PasswdEntry specifies arbitrary data to append to a file.
+	PasswdEntry string `json:"passwd_entry,omitempty"`
+	// MountAllDevices is an option to indicate whether a privileged container
+	// will mount all the host's devices
+	MountAllDevices bool `json:"mountAllDevices"`
+	// ReadWriteTmpfs indicates whether all tmpfs should be mounted readonly when in ReadOnly mode
+	ReadWriteTmpfs bool `json:"readWriteTmpfs"`
+}
+
+// InfraInherit contains the compatible options inheritable from the infra container
+type InfraInherit struct {
+	ApparmorProfile    string                   `json:"apparmor_profile,omitempty"`
+	CapAdd             []string                 `json:"cap_add,omitempty"`
+	CapDrop            []string                 `json:"cap_drop,omitempty"`
+	HostDeviceList     []spec.LinuxDevice       `json:"host_device_list,omitempty"`
+	ImageVolumes       []*specgen.ImageVolume   `json:"image_volumes,omitempty"`
+	Mounts             []spec.Mount             `json:"mounts,omitempty"`
+	NoNewPrivileges    bool                     `json:"no_new_privileges,omitempty"`
+	OverlayVolumes     []*specgen.OverlayVolume `json:"overlay_volumes,omitempty"`
+	SeccompPolicy      string                   `json:"seccomp_policy,omitempty"`
+	SeccompProfilePath string                   `json:"seccomp_profile_path,omitempty"`
+	SelinuxOpts        []string                 `json:"selinux_opts,omitempty"`
+	Volumes            []*specgen.NamedVolume   `json:"volumes,omitempty"`
+	ShmSize            *int64                   `json:"shm_size"`
+	ShmSizeSystemd     *int64                   `json:"shm_size_systemd"`
+}
+
+// IsDefaultShmSize determines if the user actually set the shm in the parent ctr or if it has been set to the default size
+func (inherit *InfraInherit) IsDefaultShmSize() bool {
+	return inherit.ShmSize == nil || *inherit.ShmSize == 65536000
 }

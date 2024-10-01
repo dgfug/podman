@@ -4,6 +4,21 @@
 #
 
 load helpers
+load helpers.network
+
+function teardown() {
+    # Destroy all images, to make sure we don't leave garbage behind.
+    #
+    # The tests in here do funky things with image store, including
+    # reloading the default $IMAGE in a way that appears normal but
+    # is not actually the same as what is normally pulled, e.g.,
+    # annotations and image digests may be different. See
+    # https://github.com/containers/podman/discussions/17911
+    run_podman rmi -a -f
+    _prefetch $IMAGE
+
+    basic_teardown
+}
 
 # Custom helpers for this test only. These just save us having to duplicate
 # the same thing four times (two tests, each with -i and stdin).
@@ -52,9 +67,7 @@ verify_iid_and_name() {
     # which redirects stdout and stderr. Here we need to guarantee
     # that podman's stdout is a pipe, not any other form of redirection
     $PODMAN save --format oci-archive $fqin | cat >$archive
-    if [ "$status" -ne 0 ]; then
-        die "Command failed: podman save ... | cat"
-    fi
+    assert "$?" -eq 0 "Command failed: podman save ... | cat"
 
     # Make sure we can reload it
     run_podman rmi $fqin
@@ -64,18 +77,102 @@ verify_iid_and_name() {
     run_podman images $fqin --format '{{.Repository}}:{{.Tag}}'
     is "${lines[0]}" "$fqin" "image preserves name across save/load"
 
-    # Load with a new tag
-    local new_name=x1$(random_string 14 | tr A-Z a-z)
-    local new_tag=t1$(random_string 6 | tr A-Z a-z)
-    run_podman rmi $fqin
-
-    run_podman load -i $archive
-    run_podman images --format '{{.Repository}}:{{.Tag}}' --sort tag
-    is "${lines[0]}" "$IMAGE"     "image is preserved"
-    is "${lines[1]}" "$fqin"      "image is reloaded with old fqin"
-
     # Clean up
     run_podman rmi $fqin
+}
+
+@test "podman image scp transfer" {
+    skip_if_remote "only applicable under local podman"
+
+    # See https://github.com/containers/podman/pull/21300 for details
+    if [[ "$CI_DESIRED_DATABASE" = "boltdb" ]]; then
+        skip "impossible due to pitfalls in our SSH implementation"
+    fi
+
+    # FIXME: Broken on debian SID; still broken 2024-09-11
+    # See https://github.com/containers/podman/pull/23020#issuecomment-2179284640
+    OS_RELEASE_ID="${OS_RELEASE_ID:-$(source /etc/os-release; echo $ID)}"
+    if [[ "$OS_RELEASE_ID" == "debian" ]]; then
+        skip "broken warning about cgroup-manager=systemd and enabling linger"
+    fi
+
+    # The testing is the same whether we're root or rootless; all that
+    # differs is the destination (not-me) username.
+    if is_rootless; then
+        # Simple: push to root.
+        whoami=$(id -un)
+        notme=root
+        _sudo() { command sudo -n "$@"; }
+    else
+        # Harder: our CI infrastructure needs to define this & set up the acct
+        whoami=root
+        notme=${PODMAN_ROOTLESS_USER}
+        if [[ -z "$notme" ]]; then
+            skip "To run this test, set PODMAN_ROOTLESS_USER to a safe username"
+        fi
+        _sudo() { command sudo -n -u "$notme" "$@"; }
+    fi
+
+    # If we can't sudo, we can't test.
+    _sudo true || skip "cannot sudo to $notme"
+
+    # Preserve digest of original image; we will compare against it later
+    run_podman image inspect --format '{{.RepoDigests}}' $IMAGE
+    src_digests=$output
+
+    # image name that is not likely to exist in the destination
+    newname=foo.bar/nonesuch/c_$(random_string 10 | tr A-Z a-z):mytag
+    run_podman tag $IMAGE $newname
+
+    # Copy it there.
+    run_podman image scp $newname ${notme}@localhost::
+    is "$output" "Copying blob .*Copying config.*Writing manifest"
+
+    # confirm that image was copied. FIXME: also try $PODMAN image inspect?
+    _sudo $PODMAN image exists $newname
+
+    # Copy it back, this time using -q
+    run_podman untag $IMAGE $newname
+    run_podman image scp -q ${notme}@localhost::$newname
+
+    expect="Loaded image: $newname"
+    is "$output" "$expect" "-q silences output"
+
+    # Confirm that we have it, and that its digest matches our original
+    run_podman image inspect --format '{{.Digest}}' $newname
+    assert "$output" =~ "$src_digests" "Digest of re-fetched image is in list of original image digests"
+
+    # test tagging capability
+    run_podman untag $IMAGE $newname
+    run_podman image scp ${notme}@localhost::$newname foobar:123
+
+    run_podman image inspect --format '{{.Digest}}' foobar:123
+    assert "$output" =~ "$src_digest" "Digest of re-fetched image is in list of original image digests"
+
+    # remove root img for transfer back with another name
+    _sudo $PODMAN image rm $newname
+
+    # get foobar's ID, for an ID transfer test
+    run_podman image inspect --format '{{.ID}}' foobar:123
+    run_podman image scp $output ${notme}@localhost::foobartwo
+
+    _sudo $PODMAN image exists foobartwo
+
+    # Clean up
+    _sudo $PODMAN image rm foobartwo
+    run_podman untag $IMAGE $newname
+
+    # Negative test for nonexistent image.
+    # FIXME: error message is 2 lines, the 2nd being "exit status 125".
+    # FIXME: is that fixable, or do we have to live with it?
+    nope="nope.nope/nonesuch:notag"
+    run_podman 125 image scp ${notme}@localhost::$nope
+    is "$output" "Error: $nope: image not known.*" "Pulling nonexistent image"
+
+    run_podman 125 image scp $nope ${notme}@localhost::
+    is "$output" "Error: $nope: image not known.*" "Pushing nonexistent image"
+
+    run_podman rmi foobar:123
 }
 
 
@@ -100,10 +197,6 @@ verify_iid_and_name() {
     run_podman rmi $iid
     run_podman image load < $archive
     verify_iid_and_name "<none>:<none>"
-
-    # Cleanup: since load-by-iid doesn't preserve name, re-tag it;
-    # otherwise our global teardown will rmi and re-pull our standard image.
-    run_podman tag $iid $img_name
 }
 
 @test "podman load - by image name" {
@@ -166,8 +259,8 @@ verify_iid_and_name() {
     img2="$PODMAN_TEST_IMAGE_REGISTRY/$PODMAN_TEST_IMAGE_USER/$PODMAN_TEST_IMAGE_NAME:multiimage"
     archive=$PODMAN_TMPDIR/myimage-$(random_string 8).tar
 
-    run_podman pull $img1
-    run_podman pull $img2
+    _prefetch $img1
+    _prefetch $img2
 
     run_podman save -m -o $archive $img1 $img2
     run_podman rmi -f $img1 $img2
@@ -184,16 +277,14 @@ verify_iid_and_name() {
     img2="$PODMAN_TEST_IMAGE_REGISTRY/$PODMAN_TEST_IMAGE_USER/$PODMAN_TEST_IMAGE_NAME:multiimage"
     archive=$PODMAN_TMPDIR/myimage-$(random_string 8).tar
 
-    run_podman pull $img1
-    run_podman pull $img2
+    _prefetch $img1
+    _prefetch $img2
 
     # We can't use run_podman because that uses the BATS 'run' function
     # which redirects stdout and stderr. Here we need to guarantee
     # that podman's stdout is a pipe, not any other form of redirection
     $PODMAN save -m $img1 $img2 | cat >$archive
-    if [ "$status" -ne 0 ]; then
-        die "Command failed: podman save ... | cat"
-    fi
+    assert "$?" -eq 0 "Command failed: podman save ... | cat"
 
     run_podman rmi -f $img1 $img2
     run_podman load -i $archive
@@ -210,7 +301,7 @@ verify_iid_and_name() {
 
     # Create a tarball, unpack it and make sure the layers are uncompressed.
     run_podman save -o $archive --format oci-archive --uncompressed $IMAGE
-    run tar -C $untar -xvf $archive
+    tar -C $untar -xvf $archive
     run file $untar/blobs/sha256/*
     is "$output" ".*POSIX tar archive" "layers are uncompressed"
 }

@@ -1,4 +1,4 @@
-// +build windows
+//go:build windows
 
 package terminal
 
@@ -25,6 +25,7 @@ func setConsoleMode(handle windows.Handle, flags uint32) error {
 	var mode uint32
 	err := windows.GetConsoleMode(handle, &mode)
 	if err != nil {
+		//nolint:nilerr
 		return nil // not a terminal
 	}
 	if err := windows.SetConsoleMode(handle, mode|flags); err != nil {

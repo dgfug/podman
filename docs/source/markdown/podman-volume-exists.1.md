@@ -1,4 +1,4 @@
-% podman-volume-exists(1)
+% podman-volume-exists 1
 
 ## NAME
 podman\-volume\-exists - Check if the given volume exists
@@ -7,8 +7,8 @@ podman\-volume\-exists - Check if the given volume exists
 **podman volume exists** *volume*
 
 ## DESCRIPTION
-**podman volume exists** checks if a volume exists. Podman will return an exit code
-of `0` when the volume is found. A `1` will be returned otherwise. An exit code of
+**podman volume exists** checks if a volume exists. Podman returns an exit code
+of `0` when the volume is found. A `1` is returned otherwise. An exit code of
 `125` indicates there was another issue.
 
 
@@ -28,7 +28,7 @@ $ echo $?
 $
 ```
 
-Check if an volume called `mysql` exists (the volume does not actually exist).
+Check if a volume called `mysql` exists (the volume does not actually exist).
 ```
 $ podman volume exists mysql
 $ echo $?

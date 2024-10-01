@@ -1,16 +1,16 @@
 package volumes
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
-	"github.com/containers/podman/v3/cmd/podman/common"
-	"github.com/containers/podman/v3/cmd/podman/inspect"
-	"github.com/containers/podman/v3/cmd/podman/parse"
-	"github.com/containers/podman/v3/cmd/podman/registry"
-	"github.com/containers/podman/v3/pkg/domain/entities"
-	"github.com/containers/podman/v3/utils"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/parse"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/errorhandling"
+	"github.com/containers/podman/v5/utils"
 	"github.com/spf13/cobra"
 )
 
@@ -25,7 +25,7 @@ var (
 		Args:              cobra.ExactArgs(2),
 		ValidArgsFunction: common.AutocompleteVolumes,
 		Example: `podman volume import my_vol /home/user/import.tar
-  cat ctr.tar | podman import volume my_vol -`,
+  cat ctr.tar | podman volume import my_vol -`,
 	}
 )
 
@@ -60,10 +60,14 @@ func importVol(cmd *cobra.Command, args []string) error {
 		tarFile = os.Stdin
 	}
 
-	inspectOpts.Type = inspect.VolumeType
-	volumeData, _, err := containerEngine.VolumeInspect(ctx, volumes, inspectOpts)
+	inspectOpts.Type = common.VolumeType
+	inspectOpts.Type = common.VolumeType
+	volumeData, errs, err := containerEngine.VolumeInspect(ctx, volumes, inspectOpts)
 	if err != nil {
 		return err
+	}
+	if len(errs) > 0 {
+		return errorhandling.JoinErrors(errs)
 	}
 	if len(volumeData) < 1 {
 		return errors.New("no volume data found")

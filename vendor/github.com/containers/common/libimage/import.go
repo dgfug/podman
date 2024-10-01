@@ -1,7 +1,10 @@
+//go:build !remote
+
 package libimage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -10,7 +13,6 @@ import (
 	storageTransport "github.com/containers/image/v5/storage"
 	tarballTransport "github.com/containers/image/v5/tarball"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -49,21 +51,24 @@ func (r *Runtime) Import(ctx context.Context, path string, options *ImportOption
 		ic = config.ImageConfig
 	}
 
-	hist := []v1.History{
+	history := []v1.History{
 		{Comment: options.CommitMessage},
 	}
 
 	config := v1.Image{
-		Config:       ic,
-		History:      hist,
-		OS:           options.OS,
-		Architecture: options.Arch,
+		Config:  ic,
+		History: history,
+		Platform: v1.Platform{
+			OS:           options.OS,
+			Architecture: options.Arch,
+			Variant:      options.Variant,
+		},
 	}
 
 	u, err := url.ParseRequestURI(path)
 	if err == nil && u.Scheme != "" {
 		// If source is a URL, download the file.
-		fmt.Printf("Downloading from %q\n", path)
+		fmt.Printf("Downloading from %q\n", path) //nolint:forbidigo
 		file, err := download.FromURL(r.systemContext.BigFilesTemporaryDir, path)
 		if err != nil {
 			return "", err
@@ -103,9 +108,9 @@ func (r *Runtime) Import(ctx context.Context, path string, options *ImportOption
 	if err != nil {
 		return "", err
 	}
-	defer c.close()
+	defer c.Close()
 
-	if _, err := c.copy(ctx, srcRef, destRef); err != nil {
+	if _, err := c.Copy(ctx, srcRef, destRef); err != nil {
 		return "", err
 	}
 
@@ -116,7 +121,7 @@ func (r *Runtime) Import(ctx context.Context, path string, options *ImportOption
 	if options.Tag != "" {
 		image, _, err := r.LookupImage(name, nil)
 		if err != nil {
-			return "", errors.Wrap(err, "looking up imported image")
+			return "", fmt.Errorf("looking up imported image: %w", err)
 		}
 		if err := image.Tag(options.Tag); err != nil {
 			return "", err

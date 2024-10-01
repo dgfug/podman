@@ -1,4 +1,6 @@
-package test_bindings
+//go:build linux
+
+package bindings_test
 
 import (
 	"context"
@@ -11,12 +13,12 @@ import (
 	"strconv"
 	"syscall"
 
-	"github.com/containers/podman/v3/pkg/bindings"
-	"github.com/containers/podman/v3/pkg/bindings/containers"
-	"github.com/containers/podman/v3/pkg/bindings/images"
-	"github.com/containers/podman/v3/pkg/bindings/pods"
-	"github.com/containers/podman/v3/pkg/bindings/system"
-	. "github.com/onsi/ginkgo"
+	"github.com/containers/podman/v5/pkg/bindings"
+	"github.com/containers/podman/v5/pkg/bindings/containers"
+	"github.com/containers/podman/v5/pkg/bindings/images"
+	"github.com/containers/podman/v5/pkg/bindings/pods"
+	"github.com/containers/podman/v5/pkg/bindings/system"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	. "github.com/onsi/gomega/gexec"
 )

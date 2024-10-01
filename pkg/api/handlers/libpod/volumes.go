@@ -1,22 +1,26 @@
+//go:build !remote
+
 package libpod
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 
-	"github.com/containers/podman/v3/libpod"
-	"github.com/containers/podman/v3/libpod/define"
-	"github.com/containers/podman/v3/pkg/api/handlers/utils"
-	api "github.com/containers/podman/v3/pkg/api/types"
-	"github.com/containers/podman/v3/pkg/domain/entities"
-	"github.com/containers/podman/v3/pkg/domain/entities/reports"
-	"github.com/containers/podman/v3/pkg/domain/filters"
-	"github.com/containers/podman/v3/pkg/domain/infra/abi"
-	"github.com/containers/podman/v3/pkg/domain/infra/abi/parse"
-	"github.com/containers/podman/v3/pkg/util"
+	"errors"
+
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/api/handlers/utils"
+	api "github.com/containers/podman/v5/pkg/api/types"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/entities/reports"
+	"github.com/containers/podman/v5/pkg/domain/filters"
+	"github.com/containers/podman/v5/pkg/domain/infra/abi"
+	"github.com/containers/podman/v5/pkg/domain/infra/abi/parse"
+	"github.com/containers/podman/v5/pkg/util"
 	"github.com/gorilla/schema"
-	"github.com/pkg/errors"
 )
 
 func CreateVolume(w http.ResponseWriter, r *http.Request) {
@@ -25,20 +29,19 @@ func CreateVolume(w http.ResponseWriter, r *http.Request) {
 		runtime       = r.Context().Value(api.RuntimeKey).(*libpod.Runtime)
 		decoder       = r.Context().Value(api.DecoderKey).(*schema.Decoder)
 	)
-	query := struct {
-	}{
+	query := struct{}{
 		// override any golang type defaults
 	}
 	if err := decoder.Decode(&query, r.URL.Query()); err != nil {
-		utils.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError,
-			errors.Wrapf(err, "failed to parse parameters for %s", r.URL.String()))
+		utils.Error(w, http.StatusInternalServerError,
+			fmt.Errorf("failed to parse parameters for %s: %w", r.URL.String(), err))
 		return
 	}
 
 	input := entities.VolumeCreateOptions{}
 	// decode params from body
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
-		utils.Error(w, "Something went wrong.", http.StatusInternalServerError, errors.Wrap(err, "Decode()"))
+		utils.Error(w, http.StatusInternalServerError, fmt.Errorf("Decode(): %w", err))
 		return
 	}
 
@@ -69,6 +72,11 @@ func CreateVolume(w http.ResponseWriter, r *http.Request) {
 		}
 		volumeOptions = append(volumeOptions, parsedOptions...)
 	}
+
+	if input.IgnoreIfExists {
+		volumeOptions = append(volumeOptions, libpod.WithVolumeIgnoreIfExist())
+	}
+
 	vol, err := runtime.NewVolume(r.Context(), volumeOptions...)
 	if err != nil {
 		utils.InternalServerError(w, err)
@@ -86,9 +94,7 @@ func CreateVolume(w http.ResponseWriter, r *http.Request) {
 }
 
 func InspectVolume(w http.ResponseWriter, r *http.Request) {
-	var (
-		runtime = r.Context().Value(api.RuntimeKey).(*libpod.Runtime)
-	)
+	runtime := r.Context().Value(api.RuntimeKey).(*libpod.Runtime)
 	name := utils.GetName(r)
 	vol, err := runtime.GetVolume(name)
 	if err != nil {
@@ -107,20 +113,22 @@ func InspectVolume(w http.ResponseWriter, r *http.Request) {
 }
 
 func ListVolumes(w http.ResponseWriter, r *http.Request) {
-	var (
-		runtime = r.Context().Value(api.RuntimeKey).(*libpod.Runtime)
-	)
+	runtime := r.Context().Value(api.RuntimeKey).(*libpod.Runtime)
 	filterMap, err := util.PrepareFilters(r)
 	if err != nil {
-		utils.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError,
-			errors.Wrapf(err, "failed to parse parameters for %s", r.URL.String()))
+		utils.Error(w, http.StatusInternalServerError,
+			fmt.Errorf("failed to parse parameters for %s: %w", r.URL.String(), err))
 		return
 	}
 
-	volumeFilters, err := filters.GenerateVolumeFilters(*filterMap)
-	if err != nil {
-		utils.InternalServerError(w, err)
-		return
+	volumeFilters := []libpod.VolumeFilter{}
+	for filter, filterValues := range *filterMap {
+		filterFunc, err := filters.GenerateVolumeFilters(filter, filterValues, runtime)
+		if err != nil {
+			utils.InternalServerError(w, err)
+			return
+		}
+		volumeFilters = append(volumeFilters, filterFunc)
 	}
 
 	vols, err := runtime.Volumes(volumeFilters...)
@@ -153,18 +161,20 @@ func PruneVolumes(w http.ResponseWriter, r *http.Request) {
 }
 
 func pruneVolumesHelper(r *http.Request) ([]*reports.PruneReport, error) {
-	var (
-		runtime = r.Context().Value(api.RuntimeKey).(*libpod.Runtime)
-	)
+	runtime := r.Context().Value(api.RuntimeKey).(*libpod.Runtime)
 	filterMap, err := util.PrepareFilters(r)
 	if err != nil {
 		return nil, err
 	}
 
 	f := (url.Values)(*filterMap)
-	filterFuncs, err := filters.GeneratePruneVolumeFilters(f)
-	if err != nil {
-		return nil, err
+	filterFuncs := []libpod.VolumeFilter{}
+	for filter, filterValues := range f {
+		filterFunc, err := filters.GeneratePruneVolumeFilters(filter, filterValues, runtime)
+		if err != nil {
+			return nil, err
+		}
+		filterFuncs = append(filterFuncs, filterFunc)
 	}
 
 	reports, err := runtime.PruneVolumes(r.Context(), filterFuncs)
@@ -187,8 +197,8 @@ func RemoveVolume(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := decoder.Decode(&query, r.URL.Query()); err != nil {
-		utils.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError,
-			errors.Wrapf(err, "failed to parse parameters for %s", r.URL.String()))
+		utils.Error(w, http.StatusInternalServerError,
+			fmt.Errorf("failed to parse parameters for %s: %w", r.URL.String(), err))
 		return
 	}
 	name := utils.GetName(r)
@@ -198,8 +208,8 @@ func RemoveVolume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := runtime.RemoveVolume(r.Context(), vol, query.Force, query.Timeout); err != nil {
-		if errors.Cause(err) == define.ErrVolumeBeingUsed {
-			utils.Error(w, "volumes being used", http.StatusConflict, err)
+		if errors.Is(err, define.ErrVolumeBeingUsed) {
+			utils.Error(w, http.StatusConflict, err)
 			return
 		}
 		utils.InternalServerError(w, err)
@@ -216,11 +226,11 @@ func ExistsVolume(w http.ResponseWriter, r *http.Request) {
 	ic := abi.ContainerEngine{Libpod: runtime}
 	report, err := ic.VolumeExists(r.Context(), name)
 	if err != nil {
-		utils.Error(w, "Something went wrong.", http.StatusInternalServerError, err)
+		utils.Error(w, http.StatusInternalServerError, err)
 		return
 	}
 	if !report.Value {
-		utils.Error(w, "volume not found", http.StatusNotFound, define.ErrNoSuchVolume)
+		utils.Error(w, http.StatusNotFound, define.ErrNoSuchVolume)
 		return
 	}
 	utils.WriteResponse(w, http.StatusNoContent, "")

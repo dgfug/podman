@@ -1,3 +1,5 @@
+//go:build !remote
+
 package server
 
 import (
@@ -14,13 +16,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/containers/podman/v3/libpod"
-	"github.com/containers/podman/v3/libpod/shutdown"
-	"github.com/containers/podman/v3/pkg/api/handlers"
-	"github.com/containers/podman/v3/pkg/api/server/idle"
-	"github.com/containers/podman/v3/pkg/api/types"
-	"github.com/containers/podman/v3/pkg/domain/entities"
-	"github.com/coreos/go-systemd/v22/activation"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/libpod/shutdown"
+	"github.com/containers/podman/v5/pkg/api/handlers"
+	"github.com/containers/podman/v5/pkg/api/server/idle"
+	"github.com/containers/podman/v5/pkg/api/types"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/schema"
@@ -46,10 +47,8 @@ const (
 	UnlimitedServiceDuration = 0 * time.Second
 )
 
-var (
-	// shutdownOnce ensures Shutdown() may safely be called from several go routines
-	shutdownOnce sync.Once
-)
+// shutdownOnce ensures Shutdown() may safely be called from several go routines
+var shutdownOnce sync.Once
 
 // NewServer will create and configure a new API server with all defaults
 func NewServer(runtime *libpod.Runtime) (*APIServer, error) {
@@ -60,33 +59,18 @@ func NewServer(runtime *libpod.Runtime) (*APIServer, error) {
 }
 
 // NewServerWithSettings will create and configure a new API server using provided settings
-func NewServerWithSettings(runtime *libpod.Runtime, listener *net.Listener, opts entities.ServiceOptions) (*APIServer, error) {
+func NewServerWithSettings(runtime *libpod.Runtime, listener net.Listener, opts entities.ServiceOptions) (*APIServer, error) {
 	return newServer(runtime, listener, opts)
 }
 
-func newServer(runtime *libpod.Runtime, listener *net.Listener, opts entities.ServiceOptions) (*APIServer, error) {
-	// If listener not provided try socket activation protocol
-	if listener == nil {
-		if _, found := os.LookupEnv("LISTEN_PID"); !found {
-			return nil, fmt.Errorf("no service listener provided and socket activation protocol is not active")
-		}
-
-		listeners, err := activation.Listeners()
-		if err != nil {
-			return nil, fmt.Errorf("cannot retrieve file descriptors from systemd: %w", err)
-		}
-		if len(listeners) != 1 {
-			return nil, fmt.Errorf("wrong number of file descriptors for socket activation protocol (%d != 1)", len(listeners))
-		}
-		listener = &listeners[0]
-	}
+func newServer(runtime *libpod.Runtime, listener net.Listener, opts entities.ServiceOptions) (*APIServer, error) {
+	logrus.Infof("API service listening on %q. URI: %q", listener.Addr(), runtime.RemoteURI())
 	if opts.CorsHeaders == "" {
 		logrus.Debug("CORS Headers were not set")
 	} else {
 		logrus.Debugf("CORS Headers were set to %q", opts.CorsHeaders)
 	}
 
-	logrus.Infof("API service listening on %q", (*listener).Addr())
 	router := mux.NewRouter().UseEncodedPath()
 	tracker := idle.NewTracker(opts.Timeout)
 
@@ -101,13 +85,14 @@ func newServer(runtime *libpod.Runtime, listener *net.Listener, opts entities.Se
 			IdleTimeout: opts.Timeout * 2,
 		},
 		CorsHeaders: opts.CorsHeaders,
-		Listener:    *listener,
+		Listener:    listener,
 		PProfAddr:   opts.PProfAddr,
 		idleTracker: tracker,
 	}
 
 	server.BaseContext = func(l net.Listener) context.Context {
 		ctx := context.WithValue(context.Background(), types.DecoderKey, handlers.NewAPIDecoder())
+		ctx = context.WithValue(ctx, types.CompatDecoderKey, handlers.NewCompatAPIDecoder())
 		ctx = context.WithValue(ctx, types.RuntimeKey, runtime)
 		ctx = context.WithValue(ctx, types.IdleTrackerKey, tracker)
 		return ctx
@@ -147,11 +132,11 @@ func newServer(runtime *libpod.Runtime, listener *net.Listener, opts entities.Se
 		server.registerMonitorHandlers,
 		server.registerNetworkHandlers,
 		server.registerPingHandlers,
-		server.registerPlayHandlers,
+		server.registerKubeHandlers,
 		server.registerPluginsHandlers,
 		server.registerPodsHandlers,
 		server.registerSecretHandlers,
-		server.RegisterSwaggerHandlers,
+		server.registerSwaggerHandlers,
 		server.registerSwarmHandlers,
 		server.registerSystemHandlers,
 		server.registerVersionHandlers,
@@ -165,7 +150,7 @@ func newServer(runtime *libpod.Runtime, listener *net.Listener, opts entities.Se
 	if logrus.IsLevelEnabled(logrus.TraceLevel) {
 		// If in trace mode log request and response bodies
 		router.Use(loggingHandler())
-		router.Walk(func(route *mux.Route, r *mux.Router, ancestors []*mux.Route) error { // nolint
+		_ = router.Walk(func(route *mux.Route, r *mux.Router, ancestors []*mux.Route) error {
 			path, err := route.GetPathTemplate()
 			if err != nil {
 				path = "<N/A>"
@@ -184,7 +169,8 @@ func newServer(runtime *libpod.Runtime, listener *net.Listener, opts entities.Se
 
 // setupSystemd notifies systemd API service is ready
 // If the NOTIFY_SOCKET is set, communicate the PID and readiness, and unset INVOCATION_ID
-// so conmon and containers are in the correct cgroup.
+// so conmon and containers are in the correct cgroup.  Also unset NOTIFY_SOCKET
+// to avoid any further usage of the socket.
 func (s *APIServer) setupSystemd() {
 	if _, found := os.LookupEnv("NOTIFY_SOCKET"); !found {
 		return
@@ -193,13 +179,16 @@ func (s *APIServer) setupSystemd() {
 	payload := fmt.Sprintf("MAINPID=%d\n", os.Getpid())
 	payload += daemon.SdNotifyReady
 	if sent, err := daemon.SdNotify(true, payload); err != nil {
-		logrus.Error("API service failed to notify systemd of Conmon PID: " + err.Error())
+		logrus.Errorf("API service failed to notify systemd of Conmon PID: %v", err)
 	} else if !sent {
 		logrus.Warn("API service unable to successfully send SDNotify")
 	}
 
 	if err := os.Unsetenv("INVOCATION_ID"); err != nil {
-		logrus.Error("API service failed unsetting INVOCATION_ID: " + err.Error())
+		logrus.Errorf("API service failed unsetting INVOCATION_ID: %v", err)
+	}
+	if err := os.Unsetenv("NOTIFY_SOCKET"); err != nil {
+		logrus.Errorf("API service failed unsetting NOTIFY_SOCKET: %v", err)
 	}
 }
 
@@ -224,7 +213,7 @@ func (s *APIServer) Serve() error {
 	}()
 
 	// Before we start serving, ensure umask is properly set for container creation.
-	_ = syscall.Umask(0022)
+	_ = syscall.Umask(0o022)
 
 	errChan := make(chan error, 1)
 	s.setupSystemd()

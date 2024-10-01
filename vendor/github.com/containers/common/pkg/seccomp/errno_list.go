@@ -1,3 +1,5 @@
+//go:build linux && seccomp
+
 package seccomp
 
 import (

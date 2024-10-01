@@ -1,15 +1,17 @@
+//go:build !remote
+
 package generate
 
 import (
 	"fmt"
 	"testing"
 
-	"github.com/containers/podman/v3/libpod/network/types"
+	"github.com/containers/common/libnetwork/types"
 )
 
 func benchmarkParsePortMapping(b *testing.B, ports []types.PortMapping) {
 	for n := 0; n < b.N; n++ {
-		ParsePortMapping(ports, nil)
+		_, _ = ParsePortMapping(ports, nil)
 	}
 }
 

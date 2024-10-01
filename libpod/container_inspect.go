@@ -1,21 +1,20 @@
+//go:build !remote
+
 package libpod
 
 import (
+	"errors"
 	"fmt"
-	"sort"
 	"strings"
 
-	"github.com/containers/common/pkg/config"
-	"github.com/containers/podman/v3/libpod/define"
-	"github.com/containers/podman/v3/libpod/driver"
-	"github.com/containers/podman/v3/pkg/util"
-	units "github.com/docker/go-units"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/libpod/driver"
+	"github.com/containers/podman/v5/pkg/signal"
+	"github.com/containers/podman/v5/pkg/util"
+	"github.com/containers/storage/types"
+	"github.com/docker/go-units"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/opencontainers/runtime-tools/generate"
-	"github.com/opencontainers/runtime-tools/validate"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"github.com/syndtr/gocapability/capability"
 )
 
 // inspectLocked inspects a container for low-level information.
@@ -23,15 +22,15 @@ import (
 func (c *Container) inspectLocked(size bool) (*define.InspectContainerData, error) {
 	storeCtr, err := c.runtime.store.Container(c.ID())
 	if err != nil {
-		return nil, errors.Wrapf(err, "error getting container from store %q", c.ID())
+		return nil, fmt.Errorf("getting container from store %q: %w", c.ID(), err)
 	}
 	layer, err := c.runtime.store.Layer(storeCtr.LayerID)
 	if err != nil {
-		return nil, errors.Wrapf(err, "error reading information about layer %q", storeCtr.LayerID)
+		return nil, fmt.Errorf("reading information about layer %q: %w", storeCtr.LayerID, err)
 	}
 	driverData, err := driver.GetDriverData(c.runtime.store, layer.ID)
 	if err != nil {
-		return nil, errors.Wrapf(err, "error getting graph driver info %q", c.ID())
+		return nil, fmt.Errorf("getting graph driver info %q: %w", c.ID(), err)
 	}
 	return c.getContainerInspectData(size, driverData)
 }
@@ -48,6 +47,17 @@ func (c *Container) Inspect(size bool) (*define.InspectContainerData, error) {
 	}
 
 	return c.inspectLocked(size)
+}
+
+func (c *Container) volumesFrom() ([]string, error) {
+	ctrSpec, err := c.specFromState()
+	if err != nil {
+		return nil, err
+	}
+	if ctrs, ok := ctrSpec.Annotations[define.VolumesFromAnnotation]; ok {
+		return strings.Split(ctrs, ";"), nil
+	}
+	return nil, nil
 }
 
 func (c *Container) getContainerInspectData(size bool, driverData *define.DriverData) (*define.InspectContainerData, error) {
@@ -91,10 +101,20 @@ func (c *Container) getContainerInspectData(size bool, driverData *define.Driver
 		}
 	}
 
-	namedVolumes, mounts := c.sortUserVolumes(ctrSpec)
-	inspectMounts, err := c.GetInspectMounts(namedVolumes, c.config.ImageVolumes, mounts)
+	namedVolumes, mounts := c.SortUserVolumes(ctrSpec)
+	inspectMounts, err := c.GetMounts(namedVolumes, c.config.ImageVolumes, mounts)
 	if err != nil {
 		return nil, err
+	}
+
+	cgroupPath, err := c.cGroupPath()
+	if err != nil {
+		// Handle the case where the container is not running or has no cgroup.
+		if errors.Is(err, define.ErrNoCgroups) || errors.Is(err, define.ErrCtrStopped) {
+			cgroupPath = ""
+		} else {
+			return nil, err
+		}
 	}
 
 	data := &define.InspectContainerData{
@@ -103,61 +123,87 @@ func (c *Container) getContainerInspectData(size bool, driverData *define.Driver
 		Path:    path,
 		Args:    args,
 		State: &define.InspectContainerState{
-			OciVersion:   ctrSpec.Version,
-			Status:       runtimeInfo.State.String(),
-			Running:      runtimeInfo.State == define.ContainerStateRunning,
-			Paused:       runtimeInfo.State == define.ContainerStatePaused,
-			OOMKilled:    runtimeInfo.OOMKilled,
-			Dead:         runtimeInfo.State.String() == "bad state",
-			Pid:          runtimeInfo.PID,
-			ConmonPid:    runtimeInfo.ConmonPID,
-			ExitCode:     runtimeInfo.ExitCode,
-			Error:        "", // can't get yet
-			StartedAt:    runtimeInfo.StartedTime,
-			FinishedAt:   runtimeInfo.FinishedTime,
-			Checkpointed: runtimeInfo.Checkpointed,
+			OciVersion:     ctrSpec.Version,
+			Status:         runtimeInfo.State.String(),
+			Running:        runtimeInfo.State == define.ContainerStateRunning,
+			Paused:         runtimeInfo.State == define.ContainerStatePaused,
+			OOMKilled:      runtimeInfo.OOMKilled,
+			Dead:           runtimeInfo.State.String() == "bad state",
+			Pid:            runtimeInfo.PID,
+			ConmonPid:      runtimeInfo.ConmonPID,
+			ExitCode:       runtimeInfo.ExitCode,
+			Error:          runtimeInfo.Error,
+			StartedAt:      runtimeInfo.StartedTime,
+			FinishedAt:     runtimeInfo.FinishedTime,
+			Checkpointed:   runtimeInfo.Checkpointed,
+			CgroupPath:     cgroupPath,
+			RestoredAt:     runtimeInfo.RestoredTime,
+			CheckpointedAt: runtimeInfo.CheckpointedTime,
+			Restored:       runtimeInfo.Restored,
+			CheckpointPath: runtimeInfo.CheckpointPath,
+			CheckpointLog:  runtimeInfo.CheckpointLog,
+			RestoreLog:     runtimeInfo.RestoreLog,
+			StoppedByUser:  c.state.StoppedByUser,
 		},
-		Image:           config.RootfsImageID,
-		ImageName:       config.RootfsImageName,
-		ExitCommand:     config.ExitCommand,
-		Namespace:       config.Namespace,
-		Rootfs:          config.Rootfs,
-		Pod:             config.Pod,
-		ResolvConfPath:  resolvPath,
-		HostnamePath:    hostnamePath,
-		HostsPath:       hostsPath,
-		StaticDir:       config.StaticDir,
-		OCIRuntime:      config.OCIRuntime,
-		ConmonPidFile:   config.ConmonPidFile,
-		PidFile:         config.PidFile,
-		Name:            config.Name,
-		RestartCount:    int32(runtimeInfo.RestartCount),
-		Driver:          driverData.Name,
-		MountLabel:      config.MountLabel,
-		ProcessLabel:    config.ProcessLabel,
-		EffectiveCaps:   ctrSpec.Process.Capabilities.Effective,
-		BoundingCaps:    ctrSpec.Process.Capabilities.Bounding,
-		AppArmorProfile: ctrSpec.Process.ApparmorProfile,
-		ExecIDs:         execIDs,
-		GraphDriver:     driverData,
-		Mounts:          inspectMounts,
-		Dependencies:    c.Dependencies(),
-		IsInfra:         c.IsInfra(),
+		Image:                   config.RootfsImageID,
+		ImageName:               config.RootfsImageName,
+		Namespace:               config.Namespace,
+		Rootfs:                  config.Rootfs,
+		Pod:                     config.Pod,
+		ResolvConfPath:          resolvPath,
+		HostnamePath:            hostnamePath,
+		HostsPath:               hostsPath,
+		StaticDir:               config.StaticDir,
+		OCIRuntime:              config.OCIRuntime,
+		ConmonPidFile:           config.ConmonPidFile,
+		PidFile:                 config.PidFile,
+		Name:                    config.Name,
+		RestartCount:            int32(runtimeInfo.RestartCount),
+		Driver:                  driverData.Name,
+		MountLabel:              config.MountLabel,
+		ProcessLabel:            config.ProcessLabel,
+		AppArmorProfile:         ctrSpec.Process.ApparmorProfile,
+		ExecIDs:                 execIDs,
+		GraphDriver:             driverData,
+		Mounts:                  inspectMounts,
+		Dependencies:            c.Dependencies(),
+		IsInfra:                 c.IsInfra(),
+		IsService:               c.IsService(),
+		KubeExitCodePropagation: config.KubeExitCodePropagation.String(),
+		LockNumber:              c.lock.ID(),
+	}
+
+	if config.RootfsImageID != "" { // May not be set if the container was created with --rootfs
+		image, _, err := c.runtime.libimageRuntime.LookupImage(config.RootfsImageID, nil)
+		if err != nil {
+			return nil, err
+		}
+		data.ImageDigest = image.Digest().String()
+	}
+
+	if ctrSpec.Process.Capabilities != nil {
+		data.EffectiveCaps = ctrSpec.Process.Capabilities.Effective
+		data.BoundingCaps = ctrSpec.Process.Capabilities.Bounding
 	}
 
 	if c.state.ConfigPath != "" {
 		data.OCIConfigPath = c.state.ConfigPath
 	}
 
-	if c.config.HealthCheckConfig != nil {
-		// This container has a healthcheck defined in it; we need to add it's state
-		healthCheckState, err := c.getHealthCheckLog()
+	// Check if healthcheck is not nil and --no-healthcheck option is not set.
+	// If --no-healthcheck is set Test will be always set to `[NONE]`, so the
+	// inspect status should be set to nil.
+	if c.config.HealthCheckConfig != nil && !(len(c.config.HealthCheckConfig.Test) == 1 && c.config.HealthCheckConfig.Test[0] == "NONE") {
+		// This container has a healthcheck defined in it; we need to add its state
+		healthCheckState, err := c.readHealthCheckLog()
 		if err != nil {
 			// An error here is not considered fatal; no health state will be displayed
 			logrus.Error(err)
 		} else {
-			data.State.Health = healthCheckState
+			data.State.Health = &healthCheckState
 		}
+	} else {
+		data.State.Health = nil
 	}
 
 	networkConfig, err := c.getContainerNetworkInfo()
@@ -165,6 +211,7 @@ func (c *Container) getContainerInspectData(size bool, driverData *define.Driver
 		return nil, err
 	}
 	data.NetworkSettings = networkConfig
+	addInspectPortsExpose(c.config.ExposedPorts, data.NetworkSettings.Ports)
 
 	inspectConfig := c.generateInspectContainerConfig(ctrSpec)
 	data.Config = inspectConfig
@@ -194,7 +241,7 @@ func (c *Container) getContainerInspectData(size bool, driverData *define.Driver
 // Get inspect-formatted mounts list.
 // Only includes user-specified mounts. Only includes bind mounts and named
 // volumes, not tmpfs volumes.
-func (c *Container) GetInspectMounts(namedVolumes []*ContainerNamedVolume, imageVolumes []*ContainerImageVolume, mounts []spec.Mount) ([]define.InspectMount, error) {
+func (c *Container) GetMounts(namedVolumes []*ContainerNamedVolume, imageVolumes []*ContainerImageVolume, mounts []spec.Mount) ([]define.InspectMount, error) {
 	inspectMounts := []define.InspectMount{}
 
 	// No mounts, return early
@@ -212,7 +259,7 @@ func (c *Container) GetInspectMounts(namedVolumes []*ContainerNamedVolume, image
 		// volume.
 		volFromDB, err := c.runtime.state.Volume(volume.Name)
 		if err != nil {
-			return nil, errors.Wrapf(err, "error looking up volume %s in container %s config", volume.Name, c.ID())
+			return nil, fmt.Errorf("looking up volume %s in container %s config: %w", volume.Name, c.ID(), err)
 		}
 		mountStruct.Driver = volFromDB.Driver()
 
@@ -240,12 +287,12 @@ func (c *Container) GetInspectMounts(namedVolumes []*ContainerNamedVolume, image
 	for _, mount := range mounts {
 		// It's a mount.
 		// Is it a tmpfs? If so, discard.
-		if mount.Type == "tmpfs" {
+		if mount.Type == define.TypeTmpfs {
 			continue
 		}
 
 		mountStruct := define.InspectMount{}
-		mountStruct.Type = "bind"
+		mountStruct.Type = define.TypeBind
 		mountStruct.Source = mount.Source
 		mountStruct.Destination = mount.Destination
 
@@ -255,6 +302,31 @@ func (c *Container) GetInspectMounts(namedVolumes []*ContainerNamedVolume, image
 	}
 
 	return inspectMounts, nil
+}
+
+// GetSecurityOptions retrieves and returns the security related annotations and process information upon inspection
+func (c *Container) GetSecurityOptions() []string {
+	ctrSpec := c.config.Spec
+	SecurityOpt := []string{}
+	if ctrSpec.Process != nil {
+		if ctrSpec.Process.NoNewPrivileges {
+			SecurityOpt = append(SecurityOpt, "no-new-privileges")
+		}
+	}
+	if label, ok := ctrSpec.Annotations[define.InspectAnnotationLabel]; ok {
+		SecurityOpt = append(SecurityOpt, fmt.Sprintf("label=%s", label))
+	}
+	if seccomp, ok := ctrSpec.Annotations[define.InspectAnnotationSeccomp]; ok {
+		SecurityOpt = append(SecurityOpt, fmt.Sprintf("seccomp=%s", seccomp))
+	}
+	if apparmor, ok := ctrSpec.Annotations[define.InspectAnnotationApparmor]; ok {
+		SecurityOpt = append(SecurityOpt, fmt.Sprintf("apparmor=%s", apparmor))
+	}
+	if c.config.Spec != nil && c.config.Spec.Linux != nil && c.config.Spec.Linux.MaskedPaths == nil {
+		SecurityOpt = append(SecurityOpt, "unmask=all")
+	}
+
+	return SecurityOpt
 }
 
 // Parse mount options so we can populate them in the mount structure.
@@ -300,8 +372,21 @@ func (c *Container) generateInspectContainerConfig(spec *spec.Spec) *define.Insp
 	ctrConfig.User = c.config.User
 	if spec.Process != nil {
 		ctrConfig.Tty = spec.Process.Terminal
-		ctrConfig.Env = []string{}
-		ctrConfig.Env = append(ctrConfig.Env, spec.Process.Env...)
+		ctrConfig.Env = append([]string{}, spec.Process.Env...)
+
+		// finds all secrets mounted as env variables and hides the value
+		// the inspect command should not display it
+		envSecrets := c.config.EnvSecrets
+		for envIndex, envValue := range ctrConfig.Env {
+			// env variables come in the style `name=value`
+			envName := strings.Split(envValue, "=")[0]
+
+			envSecret, ok := envSecrets[envName]
+			if ok {
+				ctrConfig.Env[envIndex] = envSecret.Name + "=*******"
+			}
+		}
+
 		ctrConfig.WorkingDir = spec.Process.Cwd
 	}
 
@@ -309,7 +394,7 @@ func (c *Container) generateInspectContainerConfig(spec *spec.Spec) *define.Insp
 	ctrConfig.Timeout = c.config.Timeout
 	ctrConfig.OpenStdin = c.config.Stdin
 	ctrConfig.Image = c.config.RootfsImageName
-	ctrConfig.SystemdMode = c.config.Systemd
+	ctrConfig.SystemdMode = c.Systemd()
 
 	// Leave empty is not explicitly overwritten by user
 	if len(c.config.Command) != 0 {
@@ -319,7 +404,7 @@ func (c *Container) generateInspectContainerConfig(spec *spec.Spec) *define.Insp
 
 	// Leave empty if not explicitly overwritten by user
 	if len(c.config.Entrypoint) != 0 {
-		ctrConfig.Entrypoint = strings.Join(c.config.Entrypoint, " ")
+		ctrConfig.Entrypoint = c.config.Entrypoint
 	}
 
 	if len(c.config.Labels) != 0 {
@@ -335,11 +420,18 @@ func (c *Container) generateInspectContainerConfig(spec *spec.Spec) *define.Insp
 			ctrConfig.Annotations[k] = v
 		}
 	}
-
-	ctrConfig.StopSignal = c.config.StopSignal
+	ctrConfig.StopSignal = signal.ToDockerFormat(c.config.StopSignal)
 	// TODO: should JSON deep copy this to ensure internal pointers don't
 	// leak.
 	ctrConfig.Healthcheck = c.config.HealthCheckConfig
+
+	ctrConfig.HealthcheckOnFailureAction = c.config.HealthCheckOnFailureAction.String()
+
+	ctrConfig.HealthLogDestination = c.config.HealthLogDestination
+
+	ctrConfig.HealthMaxLogCount = c.config.HealthMaxLogCount
+
+	ctrConfig.HealthMaxLogSize = c.config.HealthMaxLogSize
 
 	ctrConfig.CreateCommand = c.config.CreateCommand
 
@@ -362,7 +454,23 @@ func (c *Container) generateInspectContainerConfig(spec *spec.Spec) *define.Insp
 		ctrConfig.Umask = c.config.Umask
 	}
 
+	ctrConfig.Passwd = c.config.Passwd
+	ctrConfig.ChrootDirs = append(ctrConfig.ChrootDirs, c.config.ChrootDirs...)
+
+	ctrConfig.SdNotifyMode = c.config.SdNotifyMode
+	ctrConfig.SdNotifySocket = c.config.SdNotifySocket
 	return ctrConfig
+}
+
+func generateIDMappings(idMappings types.IDMappingOptions) *define.InspectIDMappings {
+	var inspectMappings define.InspectIDMappings
+	for _, uid := range idMappings.UIDMap {
+		inspectMappings.UIDMap = append(inspectMappings.UIDMap, fmt.Sprintf("%d:%d:%d", uid.ContainerID, uid.HostID, uid.Size))
+	}
+	for _, gid := range idMappings.GIDMap {
+		inspectMappings.GIDMap = append(inspectMappings.GIDMap, fmt.Sprintf("%d:%d:%d", gid.ContainerID, gid.HostID, gid.Size))
+	}
+	return &inspectMappings
 }
 
 // Generate the InspectContainerHostConfig struct for the HostConfig field of
@@ -380,6 +488,9 @@ func (c *Container) generateInspectContainerHostConfig(ctrSpec *spec.Spec, named
 
 	restartPolicy := new(define.InspectRestartPolicy)
 	restartPolicy.Name = c.config.RestartPolicy
+	if restartPolicy.Name == "" {
+		restartPolicy.Name = define.RestartPolicyNo
+	}
 	restartPolicy.MaximumRetryCount = c.config.RestartRetries
 	hostConfig.RestartPolicy = restartPolicy
 	if c.config.NoCgroups {
@@ -405,33 +516,33 @@ func (c *Container) generateInspectContainerHostConfig(ctrSpec *spec.Spec, named
 	hostConfig.GroupAdd = make([]string, 0, len(c.config.Groups))
 	hostConfig.GroupAdd = append(hostConfig.GroupAdd, c.config.Groups...)
 
-	hostConfig.SecurityOpt = []string{}
 	if ctrSpec.Process != nil {
 		if ctrSpec.Process.OOMScoreAdj != nil {
 			hostConfig.OomScoreAdj = *ctrSpec.Process.OOMScoreAdj
 		}
-		if ctrSpec.Process.NoNewPrivileges {
-			hostConfig.SecurityOpt = append(hostConfig.SecurityOpt, "no-new-privileges")
-		}
 	}
+
+	hostConfig.SecurityOpt = c.GetSecurityOptions()
 
 	hostConfig.ReadonlyRootfs = ctrSpec.Root.Readonly
 	hostConfig.ShmSize = c.config.ShmSize
 	hostConfig.Runtime = "oci"
 
-	// This is very expensive to initialize.
-	// So we don't want to initialize it unless we absolutely have to - IE,
-	// there are things that require a major:minor to path translation.
-	var deviceNodes map[string]string
-
 	// Annotations
 	if ctrSpec.Annotations != nil {
+		if len(ctrSpec.Annotations) != 0 {
+			hostConfig.Annotations = ctrSpec.Annotations
+		}
+
 		hostConfig.ContainerIDFile = ctrSpec.Annotations[define.InspectAnnotationCIDFile]
 		if ctrSpec.Annotations[define.InspectAnnotationAutoremove] == define.InspectResponseTrue {
 			hostConfig.AutoRemove = true
 		}
-		if ctrs, ok := ctrSpec.Annotations[define.InspectAnnotationVolumesFrom]; ok {
-			hostConfig.VolumesFrom = strings.Split(ctrs, ",")
+		if ctrSpec.Annotations[define.InspectAnnotationAutoremoveImage] == define.InspectResponseTrue {
+			hostConfig.AutoRemoveImage = true
+		}
+		if ctrs, ok := ctrSpec.Annotations[define.VolumesFromAnnotation]; ok {
+			hostConfig.VolumesFrom = strings.Split(ctrs, ";")
 		}
 		if ctrSpec.Annotations[define.InspectAnnotationPrivileged] == define.InspectResponseTrue {
 			hostConfig.Privileged = true
@@ -439,123 +550,13 @@ func (c *Container) generateInspectContainerHostConfig(ctrSpec *spec.Spec, named
 		if ctrSpec.Annotations[define.InspectAnnotationInit] == define.InspectResponseTrue {
 			hostConfig.Init = true
 		}
-		if label, ok := ctrSpec.Annotations[define.InspectAnnotationLabel]; ok {
-			hostConfig.SecurityOpt = append(hostConfig.SecurityOpt, fmt.Sprintf("label=%s", label))
-		}
-		if seccomp, ok := ctrSpec.Annotations[define.InspectAnnotationSeccomp]; ok {
-			hostConfig.SecurityOpt = append(hostConfig.SecurityOpt, fmt.Sprintf("seccomp=%s", seccomp))
-		}
-		if apparmor, ok := ctrSpec.Annotations[define.InspectAnnotationApparmor]; ok {
-			hostConfig.SecurityOpt = append(hostConfig.SecurityOpt, fmt.Sprintf("apparmor=%s", apparmor))
+		if ctrSpec.Annotations[define.InspectAnnotationPublishAll] == define.InspectResponseTrue {
+			hostConfig.PublishAllPorts = true
 		}
 	}
 
-	// Resource limits
-	if ctrSpec.Linux != nil {
-		if ctrSpec.Linux.Resources != nil {
-			if ctrSpec.Linux.Resources.CPU != nil {
-				if ctrSpec.Linux.Resources.CPU.Shares != nil {
-					hostConfig.CpuShares = *ctrSpec.Linux.Resources.CPU.Shares
-				}
-				if ctrSpec.Linux.Resources.CPU.Period != nil {
-					hostConfig.CpuPeriod = *ctrSpec.Linux.Resources.CPU.Period
-				}
-				if ctrSpec.Linux.Resources.CPU.Quota != nil {
-					hostConfig.CpuQuota = *ctrSpec.Linux.Resources.CPU.Quota
-				}
-				if ctrSpec.Linux.Resources.CPU.RealtimePeriod != nil {
-					hostConfig.CpuRealtimePeriod = *ctrSpec.Linux.Resources.CPU.RealtimePeriod
-				}
-				if ctrSpec.Linux.Resources.CPU.RealtimeRuntime != nil {
-					hostConfig.CpuRealtimeRuntime = *ctrSpec.Linux.Resources.CPU.RealtimeRuntime
-				}
-				hostConfig.CpusetCpus = ctrSpec.Linux.Resources.CPU.Cpus
-				hostConfig.CpusetMems = ctrSpec.Linux.Resources.CPU.Mems
-			}
-			if ctrSpec.Linux.Resources.Memory != nil {
-				if ctrSpec.Linux.Resources.Memory.Limit != nil {
-					hostConfig.Memory = *ctrSpec.Linux.Resources.Memory.Limit
-				}
-				if ctrSpec.Linux.Resources.Memory.Kernel != nil {
-					hostConfig.KernelMemory = *ctrSpec.Linux.Resources.Memory.Kernel
-				}
-				if ctrSpec.Linux.Resources.Memory.Reservation != nil {
-					hostConfig.MemoryReservation = *ctrSpec.Linux.Resources.Memory.Reservation
-				}
-				if ctrSpec.Linux.Resources.Memory.Swap != nil {
-					hostConfig.MemorySwap = *ctrSpec.Linux.Resources.Memory.Swap
-				}
-				if ctrSpec.Linux.Resources.Memory.Swappiness != nil {
-					hostConfig.MemorySwappiness = int64(*ctrSpec.Linux.Resources.Memory.Swappiness)
-				} else {
-					// Swappiness has a default of -1
-					hostConfig.MemorySwappiness = -1
-				}
-				if ctrSpec.Linux.Resources.Memory.DisableOOMKiller != nil {
-					hostConfig.OomKillDisable = *ctrSpec.Linux.Resources.Memory.DisableOOMKiller
-				}
-			}
-			if ctrSpec.Linux.Resources.Pids != nil {
-				hostConfig.PidsLimit = ctrSpec.Linux.Resources.Pids.Limit
-			}
-			hostConfig.CgroupConf = ctrSpec.Linux.Resources.Unified
-			if ctrSpec.Linux.Resources.BlockIO != nil {
-				if ctrSpec.Linux.Resources.BlockIO.Weight != nil {
-					hostConfig.BlkioWeight = *ctrSpec.Linux.Resources.BlockIO.Weight
-				}
-				hostConfig.BlkioWeightDevice = []define.InspectBlkioWeightDevice{}
-				for _, dev := range ctrSpec.Linux.Resources.BlockIO.WeightDevice {
-					key := fmt.Sprintf("%d:%d", dev.Major, dev.Minor)
-					// TODO: how do we handle LeafWeight vs
-					// Weight? For now, ignore anything
-					// without Weight set.
-					if dev.Weight == nil {
-						logrus.Infof("Ignoring weight device %s as it lacks a weight", key)
-						continue
-					}
-					if deviceNodes == nil {
-						nodes, err := util.FindDeviceNodes()
-						if err != nil {
-							return nil, err
-						}
-						deviceNodes = nodes
-					}
-					path, ok := deviceNodes[key]
-					if !ok {
-						logrus.Infof("Could not locate weight device %s in system devices", key)
-						continue
-					}
-					weightDev := define.InspectBlkioWeightDevice{}
-					weightDev.Path = path
-					weightDev.Weight = *dev.Weight
-					hostConfig.BlkioWeightDevice = append(hostConfig.BlkioWeightDevice, weightDev)
-				}
-
-				readBps, err := blkioDeviceThrottle(deviceNodes, ctrSpec.Linux.Resources.BlockIO.ThrottleReadBpsDevice)
-				if err != nil {
-					return nil, err
-				}
-				hostConfig.BlkioDeviceReadBps = readBps
-
-				writeBps, err := blkioDeviceThrottle(deviceNodes, ctrSpec.Linux.Resources.BlockIO.ThrottleWriteBpsDevice)
-				if err != nil {
-					return nil, err
-				}
-				hostConfig.BlkioDeviceWriteBps = writeBps
-
-				readIops, err := blkioDeviceThrottle(deviceNodes, ctrSpec.Linux.Resources.BlockIO.ThrottleReadIOPSDevice)
-				if err != nil {
-					return nil, err
-				}
-				hostConfig.BlkioDeviceReadIOps = readIops
-
-				writeIops, err := blkioDeviceThrottle(deviceNodes, ctrSpec.Linux.Resources.BlockIO.ThrottleWriteIOPSDevice)
-				if err != nil {
-					return nil, err
-				}
-				hostConfig.BlkioDeviceWriteIOps = writeIops
-			}
-		}
+	if err := c.platformInspectContainerHostConfig(ctrSpec, hostConfig); err != nil {
+		return nil, err
 	}
 
 	// NanoCPUs.
@@ -579,7 +580,7 @@ func (c *Container) generateInspectContainerHostConfig(ctrSpec *spec.Spec, named
 		}
 	}
 	for _, mount := range mounts {
-		if mount.Type == "tmpfs" {
+		if mount.Type == define.TypeTmpfs {
 			tmpfs[mount.Destination] = strings.Join(mount.Options, ",")
 		} else {
 			// TODO - maybe we should parse for empty source/destination
@@ -599,206 +600,11 @@ func (c *Container) generateInspectContainerHostConfig(ctrSpec *spec.Spec, named
 	hostConfig.NetworkMode = networkMode
 
 	// Port bindings.
-	// Only populate if we're using CNI to configure the network.
+	// Only populate if we are creating the network namespace to configure the network.
 	if c.config.CreateNetNS {
-		hostConfig.PortBindings = makeInspectPortBindings(c.config.PortMappings, c.config.ExposedPorts)
+		hostConfig.PortBindings = makeInspectPortBindings(c.config.PortMappings)
 	} else {
 		hostConfig.PortBindings = make(map[string][]define.InspectHostPort)
-	}
-
-	// Cap add and cap drop.
-	// We need a default set of capabilities to compare against.
-	// The OCI generate package has one, and is commonly used, so we'll
-	// use it.
-	// Problem: there are 5 sets of capabilities.
-	// Use the bounding set for this computation, it's the most encompassing
-	// (but still not perfect).
-	capAdd := []string{}
-	capDrop := []string{}
-	// No point in continuing if we got a spec without a Process block...
-	if ctrSpec.Process != nil {
-		// Max an O(1) lookup table for default bounding caps.
-		boundingCaps := make(map[string]bool)
-		g, err := generate.New("linux")
-		if err != nil {
-			return nil, err
-		}
-		if !hostConfig.Privileged {
-			for _, cap := range g.Config.Process.Capabilities.Bounding {
-				boundingCaps[cap] = true
-			}
-		} else {
-			// If we are privileged, use all caps.
-			for _, cap := range capability.List() {
-				if g.HostSpecific && cap > validate.LastCap() {
-					continue
-				}
-				boundingCaps[fmt.Sprintf("CAP_%s", strings.ToUpper(cap.String()))] = true
-			}
-		}
-		// Iterate through spec caps.
-		// If it's not in default bounding caps, it was added.
-		// If it is, delete from the default set. Whatever remains after
-		// we finish are the dropped caps.
-		for _, cap := range ctrSpec.Process.Capabilities.Bounding {
-			if _, ok := boundingCaps[cap]; ok {
-				delete(boundingCaps, cap)
-			} else {
-				capAdd = append(capAdd, cap)
-			}
-		}
-		for cap := range boundingCaps {
-			capDrop = append(capDrop, cap)
-		}
-		// Sort CapDrop so it displays in consistent order (GH #9490)
-		sort.Strings(capDrop)
-	}
-	hostConfig.CapAdd = capAdd
-	hostConfig.CapDrop = capDrop
-
-	// IPC Namespace mode
-	ipcMode := ""
-	if c.config.IPCNsCtr != "" {
-		ipcMode = fmt.Sprintf("container:%s", c.config.IPCNsCtr)
-	} else if ctrSpec.Linux != nil {
-		// Locate the spec's IPC namespace.
-		// If there is none, it's ipc=host.
-		// If there is one and it has a path, it's "ns:".
-		// If no path, it's default - the empty string.
-
-		for _, ns := range ctrSpec.Linux.Namespaces {
-			if ns.Type == spec.IPCNamespace {
-				if ns.Path != "" {
-					ipcMode = fmt.Sprintf("ns:%s", ns.Path)
-				} else {
-					ipcMode = "private"
-				}
-				break
-			}
-		}
-		if ipcMode == "" {
-			ipcMode = "host"
-		}
-	}
-	hostConfig.IpcMode = ipcMode
-
-	// Cgroup namespace mode
-	cgroupMode := ""
-	if c.config.CgroupNsCtr != "" {
-		cgroupMode = fmt.Sprintf("container:%s", c.config.CgroupNsCtr)
-	} else if ctrSpec.Linux != nil {
-		// Locate the spec's cgroup namespace
-		// If there is none, it's cgroup=host.
-		// If there is one and it has a path, it's "ns:".
-		// If there is no path, it's private.
-		for _, ns := range ctrSpec.Linux.Namespaces {
-			if ns.Type == spec.CgroupNamespace {
-				if ns.Path != "" {
-					cgroupMode = fmt.Sprintf("ns:%s", ns.Path)
-				} else {
-					cgroupMode = "private"
-				}
-			}
-		}
-		if cgroupMode == "" {
-			cgroupMode = "host"
-		}
-	}
-	hostConfig.CgroupMode = cgroupMode
-
-	// CGroup parent
-	// Need to check if it's the default, and not print if so.
-	defaultCgroupParent := ""
-	switch c.CgroupManager() {
-	case config.CgroupfsCgroupsManager:
-		defaultCgroupParent = CgroupfsDefaultCgroupParent
-	case config.SystemdCgroupsManager:
-		defaultCgroupParent = SystemdDefaultCgroupParent
-	}
-	if c.config.CgroupParent != defaultCgroupParent {
-		hostConfig.CgroupParent = c.config.CgroupParent
-	}
-	hostConfig.CgroupManager = c.CgroupManager()
-
-	// PID namespace mode
-	pidMode := ""
-	if c.config.PIDNsCtr != "" {
-		pidMode = fmt.Sprintf("container:%s", c.config.PIDNsCtr)
-	} else if ctrSpec.Linux != nil {
-		// Locate the spec's PID namespace.
-		// If there is none, it's pid=host.
-		// If there is one and it has a path, it's "ns:".
-		// If there is no path, it's default - the empty string.
-		for _, ns := range ctrSpec.Linux.Namespaces {
-			if ns.Type == spec.PIDNamespace {
-				if ns.Path != "" {
-					pidMode = fmt.Sprintf("ns:%s", ns.Path)
-				} else {
-					pidMode = "private"
-				}
-				break
-			}
-		}
-		if pidMode == "" {
-			pidMode = "host"
-		}
-	}
-	hostConfig.PidMode = pidMode
-
-	// UTS namespace mode
-	utsMode := ""
-	if c.config.UTSNsCtr != "" {
-		utsMode = fmt.Sprintf("container:%s", c.config.UTSNsCtr)
-	} else if ctrSpec.Linux != nil {
-		// Locate the spec's UTS namespace.
-		// If there is none, it's uts=host.
-		// If there is one and it has a path, it's "ns:".
-		// If there is no path, it's default - the empty string.
-		for _, ns := range ctrSpec.Linux.Namespaces {
-			if ns.Type == spec.UTSNamespace {
-				if ns.Path != "" {
-					utsMode = fmt.Sprintf("ns:%s", ns.Path)
-				} else {
-					utsMode = "private"
-				}
-				break
-			}
-		}
-		if utsMode == "" {
-			utsMode = "host"
-		}
-	}
-	hostConfig.UTSMode = utsMode
-
-	// User namespace mode
-	usernsMode := ""
-	if c.config.UserNsCtr != "" {
-		usernsMode = fmt.Sprintf("container:%s", c.config.UserNsCtr)
-	} else if ctrSpec.Linux != nil {
-		// Locate the spec's user namespace.
-		// If there is none, it's default - the empty string.
-		// If there is one, it's "private" if no path, or "ns:" if
-		// there's a path.
-
-		for _, ns := range ctrSpec.Linux.Namespaces {
-			if ns.Type == spec.UserNamespace {
-				if ns.Path != "" {
-					usernsMode = fmt.Sprintf("ns:%s", ns.Path)
-				} else {
-					usernsMode = "private"
-				}
-			}
-		}
-	}
-	hostConfig.UsernsMode = usernsMode
-
-	// Devices
-	// Do not include if privileged - assumed that all devices will be
-	// included.
-	var err error
-	hostConfig.Devices, err = c.GetDevices(*&hostConfig.Privileged, *ctrSpec, deviceNodes)
-	if err != nil {
-		return nil, err
 	}
 
 	// Ulimits

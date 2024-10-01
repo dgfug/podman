@@ -1,20 +1,22 @@
+//go:build !remote
+
 package compat
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 
-	"github.com/containers/podman/v3/libpod"
-	"github.com/containers/podman/v3/pkg/api/handlers/utils"
-	api "github.com/containers/podman/v3/pkg/api/types"
-	"github.com/containers/podman/v3/pkg/domain/entities"
-	"github.com/containers/podman/v3/pkg/domain/infra/abi"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/pkg/api/handlers/utils"
+	api "github.com/containers/podman/v5/pkg/api/types"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/infra/abi"
 	"github.com/containers/storage"
-	"github.com/gorilla/schema"
-	"github.com/pkg/errors"
 )
 
 func RemoveImage(w http.ResponseWriter, r *http.Request) {
-	decoder := r.Context().Value(api.DecoderKey).(*schema.Decoder)
+	decoder := utils.GetDecoder(r)
 	runtime := r.Context().Value(api.RuntimeKey).(*libpod.Runtime)
 
 	query := struct {
@@ -25,29 +27,34 @@ func RemoveImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := decoder.Decode(&query, r.URL.Query()); err != nil {
-		utils.Error(w, "Something went wrong.", http.StatusBadRequest, errors.Wrapf(err, "failed to parse parameters for %s", r.URL.String()))
+		utils.Error(w, http.StatusBadRequest, fmt.Errorf("failed to parse parameters for %s: %w", r.URL.String(), err))
 		return
 	}
-	if _, found := r.URL.Query()["noprune"]; found {
-		if query.NoPrune {
-			utils.UnSupportedParameter("noprune")
-		}
-	}
 	name := utils.GetName(r)
+	possiblyNormalizedName, err := utils.NormalizeToDockerHub(r, name)
+	if err != nil {
+		utils.Error(w, http.StatusInternalServerError, fmt.Errorf("normalizing image: %w", err))
+		return
+	}
+
 	imageEngine := abi.ImageEngine{Libpod: runtime}
 
 	options := entities.ImageRemoveOptions{
-		Force: query.Force,
+		Force:   query.Force,
+		NoPrune: query.NoPrune,
 	}
-	report, rmerrors := imageEngine.Remove(r.Context(), []string{name}, options)
+	report, rmerrors := imageEngine.Remove(r.Context(), []string{possiblyNormalizedName}, options)
 	if len(rmerrors) > 0 && rmerrors[0] != nil {
 		err := rmerrors[0]
-		if errors.Cause(err) == storage.ErrImageUnknown {
-			utils.ImageNotFound(w, name, errors.Wrapf(err, "failed to find image %s", name))
+		if errors.Is(err, storage.ErrImageUnknown) {
+			utils.ImageNotFound(w, name, fmt.Errorf("failed to find image %s: %w", name, err))
 			return
 		}
-
-		utils.Error(w, "Something went wrong.", http.StatusInternalServerError, err)
+		if errors.Is(err, storage.ErrImageUsedByContainer) {
+			utils.Error(w, http.StatusConflict, fmt.Errorf("image %s is in use: %w", name, err))
+			return
+		}
+		utils.Error(w, http.StatusInternalServerError, err)
 		return
 	}
 	response := make([]map[string]string, 0, len(report.Untagged)+1)

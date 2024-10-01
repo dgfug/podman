@@ -1,56 +1,46 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
+	"context"
 	"fmt"
-	"io/ioutil"
+	"net"
+	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"strings"
+	"time"
 
-	"github.com/containers/common/pkg/config"
-	. "github.com/containers/podman/v3/test/utils"
-	. "github.com/onsi/ginkgo"
+	. "github.com/containers/podman/v5/test/utils"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	. "github.com/onsi/gomega/gbytes"
 	. "github.com/onsi/gomega/gexec"
 )
 
+func setupConnectionsConf() {
+	// make sure connections are not written to real user config on host
+	file := filepath.Join(podmanTest.TempDir, "containers.conf")
+	f, err := os.Create(file)
+	Expect(err).ToNot(HaveOccurred())
+	f.Close()
+	os.Setenv("CONTAINERS_CONF", file)
+
+	file = filepath.Join(podmanTest.TempDir, "connections.conf")
+	os.Setenv("PODMAN_CONNECTIONS_CONF", file)
+}
+
+var systemConnectionListCmd = []string{"system", "connection", "ls", "--format", "{{.Name}} {{.URI}} {{.Identity}} {{.Default}} {{.ReadWrite}}"}
+var farmListCmd = []string{"farm", "ls", "--format", "{{.Name}} {{.Connections}} {{.Default}} {{.ReadWrite}}"}
+
 var _ = Describe("podman system connection", func() {
-	ConfPath := struct {
-		Value string
-		IsSet bool
-	}{}
 
-	var podmanTest *PodmanTestIntegration
-
-	BeforeEach(func() {
-		ConfPath.Value, ConfPath.IsSet = os.LookupEnv("CONTAINERS_CONF")
-		conf, err := ioutil.TempFile("", "containersconf")
-		Expect(err).ToNot(HaveOccurred())
-		os.Setenv("CONTAINERS_CONF", conf.Name())
-
-		tempdir, err := CreateTempDirInTempDir()
-		Expect(err).ToNot(HaveOccurred())
-		podmanTest = PodmanTestCreate(tempdir)
-		podmanTest.Setup()
-	})
-
-	AfterEach(func() {
-		podmanTest.Cleanup()
-		os.Remove(os.Getenv("CONTAINERS_CONF"))
-		if ConfPath.IsSet {
-			os.Setenv("CONTAINERS_CONF", ConfPath.Value)
-		} else {
-			os.Unsetenv("CONTAINERS_CONF")
-		}
-
-		f := CurrentGinkgoTestDescription()
-		GinkgoWriter.Write(
-			[]byte(
-				fmt.Sprintf("Test: %s completed in %f seconds", f.TestText, f.Duration.Seconds())))
-	})
+	BeforeEach(setupConnectionsConf)
 
 	Context("without running API service", func() {
 		It("add ssh://", func() {
@@ -58,21 +48,17 @@ var _ = Describe("podman system connection", func() {
 				"--default",
 				"--identity", "~/.ssh/id_rsa",
 				"QA",
-				"ssh://root@server.fubar.com:2222/run/podman/podman.sock",
+				"ssh://root@podman.test:2222/run/podman/podman.sock",
 			}
 			session := podmanTest.Podman(cmd)
 			session.WaitWithDefaultTimeout()
-			Expect(session).Should(Exit(0))
+			Expect(session).Should(ExitCleanly())
 			Expect(session.Out.Contents()).Should(BeEmpty())
 
-			cfg, err := config.ReadCustomConfig()
-			Expect(err).ShouldNot(HaveOccurred())
-			Expect(cfg).To(HaveActiveService("QA"))
-			Expect(cfg).Should(VerifyService(
-				"QA",
-				"ssh://root@server.fubar.com:2222/run/podman/podman.sock",
-				"~/.ssh/id_rsa",
-			))
+			session = podmanTest.Podman(systemConnectionListCmd)
+			session.WaitWithDefaultTimeout()
+			Expect(session).Should(ExitCleanly())
+			Expect(session.OutputToString()).To(Equal("QA ssh://root@podman.test:2222/run/podman/podman.sock ~/.ssh/id_rsa true true"))
 
 			cmd = []string{"system", "connection", "rename",
 				"QA",
@@ -80,9 +66,12 @@ var _ = Describe("podman system connection", func() {
 			}
 			session = podmanTest.Podman(cmd)
 			session.WaitWithDefaultTimeout()
-			Expect(session).Should(Exit(0))
+			Expect(session).Should(ExitCleanly())
 
-			Expect(config.ReadCustomConfig()).To(HaveActiveService("QE"))
+			session = podmanTest.Podman(systemConnectionListCmd)
+			session.WaitWithDefaultTimeout()
+			Expect(session).Should(ExitCleanly())
+			Expect(session.OutputToString()).To(Equal("QE ssh://root@podman.test:2222/run/podman/podman.sock ~/.ssh/id_rsa true true"))
 		})
 
 		It("add UDS", func() {
@@ -94,12 +83,13 @@ var _ = Describe("podman system connection", func() {
 			session.WaitWithDefaultTimeout()
 			Expect(session).Should(Exit(0))
 			Expect(session.Out.Contents()).Should(BeEmpty())
+			// stderr will probably warn (ENOENT or EACCESS) about socket
+			// but it's too unreliable to test for.
 
-			Expect(config.ReadCustomConfig()).Should(VerifyService(
-				"QA-UDS",
-				"unix:///run/podman/podman.sock",
-				"",
-			))
+			session = podmanTest.Podman(systemConnectionListCmd)
+			session.WaitWithDefaultTimeout()
+			Expect(session).Should(ExitCleanly())
+			Expect(session.OutputToString()).To(Equal("QA-UDS unix:///run/podman/podman.sock true true"))
 
 			cmd = []string{"system", "connection", "add",
 				"QA-UDS1",
@@ -111,12 +101,12 @@ var _ = Describe("podman system connection", func() {
 			Expect(session).Should(Exit(0))
 			Expect(session.Out.Contents()).Should(BeEmpty())
 
-			Expect(config.ReadCustomConfig()).Should(HaveActiveService("QA-UDS"))
-			Expect(config.ReadCustomConfig()).Should(VerifyService(
-				"QA-UDS1",
-				"unix:///run/user/podman/podman.sock",
-				"",
-			))
+			session = podmanTest.Podman(systemConnectionListCmd)
+			session.WaitWithDefaultTimeout()
+			Expect(session).Should(ExitCleanly())
+			Expect(string(session.Out.Contents())).To(Equal(`QA-UDS unix:///run/podman/podman.sock  true true
+QA-UDS1 unix:///run/user/podman/podman.sock  false true
+`))
 		})
 
 		It("add tcp", func() {
@@ -126,14 +116,120 @@ var _ = Describe("podman system connection", func() {
 			}
 			session := podmanTest.Podman(cmd)
 			session.WaitWithDefaultTimeout()
-			Expect(session).Should(Exit(0))
+			Expect(session).Should(ExitCleanly())
 			Expect(session.Out.Contents()).Should(BeEmpty())
 
-			Expect(config.ReadCustomConfig()).Should(VerifyService(
-				"QA-TCP",
-				"tcp://localhost:8888",
-				"",
-			))
+			session = podmanTest.Podman(systemConnectionListCmd)
+			session.WaitWithDefaultTimeout()
+			Expect(session).Should(ExitCleanly())
+			Expect(session.OutputToString()).To(Equal("QA-TCP tcp://localhost:8888 true true"))
+		})
+
+		It("add tcp to reverse proxy path", func() {
+			cmd := []string{"system", "connection", "add",
+				"QA-TCP-RP",
+				"tcp://localhost:8888/reverse/proxy/path/prefix",
+			}
+			session := podmanTest.Podman(cmd)
+			session.WaitWithDefaultTimeout()
+			Expect(session).Should(ExitCleanly())
+			Expect(session.Out.Contents()).Should(BeEmpty())
+
+			session = podmanTest.Podman(systemConnectionListCmd)
+			session.WaitWithDefaultTimeout()
+			Expect(session).Should(ExitCleanly())
+			Expect(session.OutputToString()).To(Equal("QA-TCP-RP tcp://localhost:8888/reverse/proxy/path/prefix true true"))
+		})
+
+		It("add to new farm", func() {
+			cmd := []string{"system", "connection", "add",
+				"--default",
+				"--identity", "~/.ssh/id_rsa",
+				"--farm", "farm1",
+				"QA",
+				"ssh://root@podman.test:2222/run/podman/podman.sock",
+			}
+			session := podmanTest.Podman(cmd)
+			session.WaitWithDefaultTimeout()
+			Expect(session).Should(ExitCleanly())
+			Expect(session.Out.Contents()).Should(BeEmpty())
+
+			session = podmanTest.Podman(systemConnectionListCmd)
+			session.WaitWithDefaultTimeout()
+			Expect(session).Should(ExitCleanly())
+			Expect(session.OutputToString()).To(Equal("QA ssh://root@podman.test:2222/run/podman/podman.sock ~/.ssh/id_rsa true true"))
+			session = podmanTest.Podman(farmListCmd)
+			session.WaitWithDefaultTimeout()
+			Expect(session).Should(ExitCleanly())
+			Expect(session.OutputToString()).To(Equal("farm1 [QA] true true"))
+		})
+
+		It("add to existing farm", func() {
+			// create empty farm
+			cmd := []string{"farm", "create", "empty-farm"}
+			session := podmanTest.Podman(cmd)
+			session.WaitWithDefaultTimeout()
+			Expect(session).Should(ExitCleanly())
+			Expect(session.Out.Contents()).Should(ContainSubstring("Farm \"empty-farm\" created"))
+
+			cmd = []string{"system", "connection", "add",
+				"--default",
+				"--identity", "~/.ssh/id_rsa",
+				"--farm", "empty-farm",
+				"QA",
+				"ssh://root@podman.test:2222/run/podman/podman.sock",
+			}
+			session = podmanTest.Podman(cmd)
+			session.WaitWithDefaultTimeout()
+			Expect(session).Should(ExitCleanly())
+			Expect(session.Out.Contents()).Should(BeEmpty())
+
+			session = podmanTest.Podman(systemConnectionListCmd)
+			session.WaitWithDefaultTimeout()
+			Expect(session).Should(ExitCleanly())
+			Expect(session.OutputToString()).To(Equal("QA ssh://root@podman.test:2222/run/podman/podman.sock ~/.ssh/id_rsa true true"))
+			session = podmanTest.Podman(farmListCmd)
+			session.WaitWithDefaultTimeout()
+			Expect(session).Should(ExitCleanly())
+			Expect(session.OutputToString()).To(Equal("empty-farm [QA] true true"))
+		})
+
+		It("removing connection should remove from farm also", func() {
+			cmd := []string{"system", "connection", "add",
+				"--default",
+				"--identity", "~/.ssh/id_rsa",
+				"--farm", "farm1",
+				"QA",
+				"ssh://root@podman.test:2222/run/podman/podman.sock",
+			}
+			session := podmanTest.Podman(cmd)
+			session.WaitWithDefaultTimeout()
+			Expect(session).Should(ExitCleanly())
+			Expect(session.Out.Contents()).Should(BeEmpty())
+
+			session = podmanTest.Podman(systemConnectionListCmd)
+			session.WaitWithDefaultTimeout()
+			Expect(session).Should(ExitCleanly())
+			Expect(session.OutputToString()).To(Equal("QA ssh://root@podman.test:2222/run/podman/podman.sock ~/.ssh/id_rsa true true"))
+			session = podmanTest.Podman(farmListCmd)
+			session.WaitWithDefaultTimeout()
+			Expect(session).Should(ExitCleanly())
+			Expect(session.OutputToString()).To(Equal("farm1 [QA] true true"))
+
+			// Remove the QA connection
+			session = podmanTest.Podman([]string{"system", "connection", "remove", "QA"})
+			session.WaitWithDefaultTimeout()
+			Expect(session).Should(ExitCleanly())
+			Expect(session.Out.Contents()).Should(BeEmpty())
+
+			session = podmanTest.Podman(systemConnectionListCmd)
+			session.WaitWithDefaultTimeout()
+			Expect(session).Should(ExitCleanly())
+			Expect(session.OutputToString()).To(Equal(""))
+			session = podmanTest.Podman(farmListCmd)
+			session.WaitWithDefaultTimeout()
+			Expect(session).Should(ExitCleanly())
+			Expect(session.OutputToString()).To(Equal("farm1 [] true true"))
 		})
 
 		It("remove", func() {
@@ -141,22 +237,22 @@ var _ = Describe("podman system connection", func() {
 				"--default",
 				"--identity", "~/.ssh/id_rsa",
 				"QA",
-				"ssh://root@server.fubar.com:2222/run/podman/podman.sock",
+				"ssh://root@podman.test:2222/run/podman/podman.sock",
 			})
 			session.WaitWithDefaultTimeout()
-			Expect(session).Should(Exit(0))
+			Expect(session).Should(ExitCleanly())
 
 			// two passes to test that removing non-existent connection is not an error
 			for i := 0; i < 2; i++ {
 				session = podmanTest.Podman([]string{"system", "connection", "remove", "QA"})
 				session.WaitWithDefaultTimeout()
-				Expect(session).Should(Exit(0))
+				Expect(session).Should(ExitCleanly())
 				Expect(session.Out.Contents()).Should(BeEmpty())
 
-				cfg, err := config.ReadCustomConfig()
-				Expect(err).ShouldNot(HaveOccurred())
-				Expect(cfg.Engine.ActiveService).To(BeEmpty())
-				Expect(cfg.Engine.ServiceDestinations).To(BeEmpty())
+				session = podmanTest.Podman(systemConnectionListCmd)
+				session.WaitWithDefaultTimeout()
+				Expect(session).Should(ExitCleanly())
+				Expect(session.OutputToString()).To(Equal(""))
 			}
 		})
 
@@ -165,20 +261,21 @@ var _ = Describe("podman system connection", func() {
 				"--default",
 				"--identity", "~/.ssh/id_rsa",
 				"QA",
-				"ssh://root@server.fubar.com:2222/run/podman/podman.sock",
+				"ssh://root@podman.test:2222/run/podman/podman.sock",
 			})
 			session.WaitWithDefaultTimeout()
-			Expect(session).Should(Exit(0))
+			Expect(session).Should(ExitCleanly())
 
 			session = podmanTest.Podman([]string{"system", "connection", "remove", "--all"})
 			session.WaitWithDefaultTimeout()
-			Expect(session).Should(Exit(0))
+			Expect(session).Should(ExitCleanly())
 			Expect(session.Out.Contents()).Should(BeEmpty())
 			Expect(session.Err.Contents()).Should(BeEmpty())
 
 			session = podmanTest.Podman([]string{"system", "connection", "list"})
 			session.WaitWithDefaultTimeout()
-			Expect(session).Should(Exit(0))
+			Expect(session).Should(ExitCleanly())
+			Expect(session.OutputToStringArray()).To(HaveLen(1))
 		})
 
 		It("default", func() {
@@ -187,39 +284,38 @@ var _ = Describe("podman system connection", func() {
 					"--default",
 					"--identity", "~/.ssh/id_rsa",
 					name,
-					"ssh://root@server.fubar.com:2222/run/podman/podman.sock",
+					"ssh://root@podman.test:2222/run/podman/podman.sock",
 				}
 				session := podmanTest.Podman(cmd)
 				session.WaitWithDefaultTimeout()
-				Expect(session).Should(Exit(0))
+				Expect(session).Should(ExitCleanly())
 			}
 
 			cmd := []string{"system", "connection", "default", "devl"}
 			session := podmanTest.Podman(cmd)
 			session.WaitWithDefaultTimeout()
-			Expect(session).Should(Exit(0))
+			Expect(session).Should(ExitCleanly())
 			Expect(session.Out.Contents()).Should(BeEmpty())
 
-			Expect(config.ReadCustomConfig()).Should(HaveActiveService("devl"))
+			session = podmanTest.Podman(systemConnectionListCmd)
+			session.WaitWithDefaultTimeout()
+			Expect(session).Should(ExitCleanly())
+			Expect(string(session.Out.Contents())).To(Equal(`devl ssh://root@podman.test:2222/run/podman/podman.sock ~/.ssh/id_rsa true true
+qe ssh://root@podman.test:2222/run/podman/podman.sock ~/.ssh/id_rsa false true
+`))
 
 			cmd = []string{"system", "connection", "list"}
 			session = podmanTest.Podman(cmd)
 			session.WaitWithDefaultTimeout()
-			Expect(session).Should(Exit(0))
+			Expect(session).Should(ExitCleanly())
 			Expect(session.Out).Should(Say("Name *URI *Identity *Default"))
-
-			cmd = []string{"system", "connection", "list", "--format", "{{.Name}}"}
-			session = podmanTest.Podman(cmd)
-			session.WaitWithDefaultTimeout()
-			Expect(session).Should(Exit(0))
-			Expect(session.OutputToString()).Should(Equal("devl qe"))
 		})
 
 		It("failed default", func() {
 			cmd := []string{"system", "connection", "default", "devl"}
 			session := podmanTest.Podman(cmd)
 			session.WaitWithDefaultTimeout()
-			Expect(session).ShouldNot(Exit(0))
+			Expect(session).ShouldNot(ExitCleanly())
 			Expect(session.Err).Should(Say("destination is not defined"))
 		})
 
@@ -227,7 +323,7 @@ var _ = Describe("podman system connection", func() {
 			cmd := []string{"system", "connection", "rename", "devl", "QE"}
 			session := podmanTest.Podman(cmd)
 			session.WaitWithDefaultTimeout()
-			Expect(session).ShouldNot(Exit(0))
+			Expect(session).ShouldNot(ExitCleanly())
 			Expect(session.Err).Should(Say("destination is not defined"))
 		})
 
@@ -235,9 +331,94 @@ var _ = Describe("podman system connection", func() {
 			cmd := []string{"system", "connection", "list"}
 			session := podmanTest.Podman(cmd)
 			session.WaitWithDefaultTimeout()
-			Expect(session).Should(Exit(0))
-			Expect(len(session.OutputToStringArray())).Should(Equal(1))
+			Expect(session).Should(ExitCleanly())
+			Expect(session.OutputToStringArray()).Should(HaveLen(1))
 			Expect(session.Err.Contents()).Should(BeEmpty())
+		})
+	})
+
+	Context("with running API service", func() {
+		BeforeEach(func() {
+			SkipIfNotRemote("requires podman API service")
+		})
+
+		It("add tcp:// connection with reverse proxy path", func() {
+			// Create a reverse proxy to the podman socket using path prefix
+			const pathPrefix = "/reverse/proxy/path/prefix"
+			proxyGotUsed := false
+			proxy := http.NewServeMux()
+			proxy.Handle(pathPrefix+"/", &httputil.ReverseProxy{
+				Rewrite: func(pr *httputil.ProxyRequest) {
+					proxyGotUsed = true
+					pr.Out.URL.Path = strings.TrimPrefix(pr.Out.URL.Path, pathPrefix)
+					pr.Out.URL.RawPath = strings.TrimPrefix(pr.Out.URL.RawPath, pathPrefix)
+					baseURL, _ := url.Parse("http://d")
+					pr.SetURL(baseURL)
+				},
+				Transport: &http.Transport{
+					DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+						By("Proxying to " + podmanTest.RemoteSocket)
+						url, err := url.Parse(podmanTest.RemoteSocket)
+						if err != nil {
+							return nil, err
+						}
+						return (&net.Dialer{}).DialContext(ctx, "unix", url.Path)
+					},
+				},
+			})
+			srv := &http.Server{
+				Handler:           proxy,
+				ReadHeaderTimeout: time.Second,
+			}
+
+			// Serve the reverse proxy on a random port
+			lis, err := net.Listen("tcp", "127.0.0.1:0")
+			Expect(err).ToNot(HaveOccurred())
+			defer lis.Close()
+
+			defer srv.Close()
+			go func() {
+				defer GinkgoRecover()
+				Expect(srv.Serve(lis)).To(MatchError(http.ErrServerClosed))
+			}()
+
+			connectionURL := "tcp://" + lis.Addr().String() + pathPrefix
+
+			cmd := exec.Command(podmanTest.RemotePodmanBinary,
+				"system", "connection", "add",
+				"--default", "QA", connectionURL,
+			)
+			session, err := Start(cmd, GinkgoWriter, GinkgoWriter)
+			Expect(err).ToNot(HaveOccurred(), fmt.Sprintf("%q failed to execute", podmanTest.RemotePodmanBinary))
+			Eventually(session, DefaultWaitTimeout).Should(Exit(0))
+			Expect(session.Out.Contents()).Should(BeEmpty())
+			Expect(session.Err.Contents()).Should(BeEmpty())
+
+			Expect(proxyGotUsed).To(BeFalse())
+			cmd = exec.Command(podmanTest.RemotePodmanBinary,
+				"--connection", "QA", "ps")
+			session, err = Start(cmd, GinkgoWriter, GinkgoWriter)
+			Expect(err).ToNot(HaveOccurred(), fmt.Sprintf("%q failed to execute", podmanTest.RemotePodmanBinary))
+			Eventually(session, DefaultWaitTimeout).Should(Exit(0))
+			Expect(session.Out.Contents()).Should(Equal([]byte(`CONTAINER ID  IMAGE       COMMAND     CREATED     STATUS      PORTS       NAMES
+`)))
+			Expect(session.Err.Contents()).Should(BeEmpty())
+			Expect(proxyGotUsed).To(BeTrue())
+
+			// export the container_host env var and try again
+			proxyGotUsed = false
+			err = os.Setenv("CONTAINER_HOST", connectionURL)
+			Expect(err).ToNot(HaveOccurred())
+			defer os.Unsetenv("CONTAINER_HOST")
+
+			cmd = exec.Command(podmanTest.RemotePodmanBinary, "ps")
+			session, err = Start(cmd, GinkgoWriter, GinkgoWriter)
+			Expect(err).ToNot(HaveOccurred(), fmt.Sprintf("%q failed to execute", podmanTest.RemotePodmanBinary))
+			Eventually(session, DefaultWaitTimeout).Should(Exit(0))
+			Expect(session.Out.Contents()).Should(Equal([]byte(`CONTAINER ID  IMAGE       COMMAND     CREATED     STATUS      PORTS       NAMES
+`)))
+			Expect(session.Err.Contents()).Should(BeEmpty())
+			Expect(proxyGotUsed).To(BeTrue())
 		})
 	})
 
@@ -247,7 +428,7 @@ var _ = Describe("podman system connection", func() {
 			// podman-remote commands will be executed by ginkgo directly.
 			SkipIfContainerized("sshd is not available when running in a container")
 			SkipIfRemote("connection heuristic requires both podman and podman-remote binaries")
-			SkipIfNotRootless("FIXME: setup ssh keys when root")
+			SkipIfNotRootless(fmt.Sprintf("FIXME: set up ssh keys when root. uid(%d) euid(%d)", os.Getuid(), os.Geteuid()))
 			SkipIfSystemdNotRunning("cannot test connection heuristic if systemd is not running")
 			SkipIfNotActive("sshd", "cannot test connection heuristic if sshd is not running")
 		})
@@ -255,6 +436,16 @@ var _ = Describe("podman system connection", func() {
 		It("add ssh:// socket path using connection heuristic", func() {
 			u, err := user.Current()
 			Expect(err).ShouldNot(HaveOccurred())
+
+			// Ensure that the remote end uses our built podman
+			if os.Getenv("PODMAN_BINARY") == "" {
+				err = os.Setenv("PODMAN_BINARY", podmanTest.PodmanBinary)
+				Expect(err).ShouldNot(HaveOccurred())
+
+				defer func() {
+					os.Unsetenv("PODMAN_BINARY")
+				}()
+			}
 
 			cmd := exec.Command(podmanTest.RemotePodmanBinary,
 				"system", "connection", "add",
@@ -269,6 +460,20 @@ var _ = Describe("podman system connection", func() {
 			Expect(session.Out.Contents()).Should(BeEmpty())
 			Expect(session.Err.Contents()).Should(BeEmpty())
 
+			cmd = exec.Command(podmanTest.RemotePodmanBinary,
+				"--connection", "QA", "ps")
+			_, err = Start(cmd, GinkgoWriter, GinkgoWriter)
+			Expect(err).ToNot(HaveOccurred())
+
+			// export the container_host env var and try again
+			err = os.Setenv("CONTAINER_HOST", fmt.Sprintf("ssh://%s@localhost", u.Username))
+			Expect(err).ToNot(HaveOccurred())
+			defer os.Unsetenv("CONTAINER_HOST")
+
+			cmd = exec.Command(podmanTest.RemotePodmanBinary, "ps")
+			_, err = Start(cmd, GinkgoWriter, GinkgoWriter)
+			Expect(err).ToNot(HaveOccurred())
+
 			uri := url.URL{
 				Scheme: "ssh",
 				User:   url.User(u.Username),
@@ -276,12 +481,12 @@ var _ = Describe("podman system connection", func() {
 				Path:   fmt.Sprintf("/run/user/%s/podman/podman.sock", u.Uid),
 			}
 
-			Expect(config.ReadCustomConfig()).Should(HaveActiveService("QA"))
-			Expect(config.ReadCustomConfig()).Should(VerifyService(
-				"QA",
-				uri.String(),
-				filepath.Join(u.HomeDir, ".ssh", "id_ed25519"),
-			))
+			cmd = exec.Command(podmanTest.RemotePodmanBinary, systemConnectionListCmd...)
+			lsSession, err := Start(cmd, GinkgoWriter, GinkgoWriter)
+			Expect(err).ToNot(HaveOccurred())
+			lsSession.Wait(DefaultWaitTimeout)
+			Expect(lsSession).Should(Exit(0))
+			Expect(string(lsSession.Out.Contents())).To(Equal("QA " + uri.String() + " " + filepath.Join(u.HomeDir, ".ssh", "id_ed25519") + " true true\n"))
 		})
 	})
 })

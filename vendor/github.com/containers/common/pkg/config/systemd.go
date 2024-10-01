@@ -1,15 +1,15 @@
-// +build systemd,cgo
+//go:build systemd && cgo
 
 package config
 
 import (
-	"io/ioutil"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
 	"github.com/containers/common/pkg/cgroupv2"
 	"github.com/containers/storage/pkg/unshare"
-	"github.com/coreos/go-systemd/v22/sdjournal"
 )
 
 var (
@@ -52,12 +52,11 @@ func defaultLogDriver() string {
 
 func useSystemd() bool {
 	systemdOnce.Do(func() {
-		dat, err := ioutil.ReadFile("/proc/1/comm")
+		dat, err := os.ReadFile("/proc/1/comm")
 		if err == nil {
 			val := strings.TrimSuffix(string(dat), "\n")
 			usesSystemd = (val == "systemd")
 		}
-		return
 	})
 	return usesSystemd
 }
@@ -67,13 +66,20 @@ func useJournald() bool {
 		if !useSystemd() {
 			return
 		}
-		journal, err := sdjournal.NewJournal()
-		if err != nil {
-			return
+		for _, root := range []string{"/run/log/journal", "/var/log/journal"} {
+			dirs, err := os.ReadDir(root)
+			if err != nil {
+				continue
+			}
+			for _, d := range dirs {
+				if d.IsDir() {
+					if _, err := os.ReadDir(filepath.Join(root, d.Name())); err == nil {
+						usesJournald = true
+						return
+					}
+				}
+			}
 		}
-		journal.Close()
-		usesJournald = true
-		return
 	})
 	return usesJournald
 }

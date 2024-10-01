@@ -1,7 +1,7 @@
-% podman-rmi(1)
+% podman-rmi 1
 
 ## NAME
-podman\-rmi - Removes one or more locally stored images
+podman\-rmi - Remove one or more locally stored images
 
 ## SYNOPSIS
 **podman rmi** [*options*] *image* [...]
@@ -22,8 +22,15 @@ Remove all images in the local storage.
 
 #### **--force**, **-f**
 
-This option will cause podman to remove all containers that are using the image before removing the image from the system.
+This option causes Podman to remove all containers that are using the image before removing the image from the system.
 
+#### **--ignore**, **-i**
+
+If a specified image does not exist in the local storage, ignore it and do not throw an error.
+
+#### **--no-prune**
+
+This option does not remove dangling parents of the specified image.
 
 Remove an image by its short ID
 ```
@@ -43,6 +50,16 @@ Remove all images and containers.
 ```
 $ podman rmi -a -f
 ```
+
+Remove an absent image with and without the `--ignore` flag.
+```
+$ podman rmi --ignore nothing
+$ podman rmi nothing
+Error: nothing: image not known
+
+```
+
+
 ## Exit Status
   **0**   All specified images removed
 

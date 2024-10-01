@@ -5,16 +5,16 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/containers/podman/v3/pkg/bindings"
-	"github.com/containers/podman/v3/pkg/domain/entities"
-	"github.com/containers/podman/v3/pkg/domain/entities/reports"
+	"github.com/containers/podman/v5/pkg/bindings"
+	"github.com/containers/podman/v5/pkg/domain/entities/reports"
+	entitiesTypes "github.com/containers/podman/v5/pkg/domain/entities/types"
 	jsoniter "github.com/json-iterator/go"
 )
 
 // Create creates a volume given its configuration.
-func Create(ctx context.Context, config entities.VolumeCreateOptions, options *CreateOptions) (*entities.VolumeConfigResponse, error) {
+func Create(ctx context.Context, config entitiesTypes.VolumeCreateOptions, options *CreateOptions) (*entitiesTypes.VolumeConfigResponse, error) {
 	var (
-		v entities.VolumeConfigResponse
+		v entitiesTypes.VolumeConfigResponse
 	)
 	if options == nil {
 		options = new(CreateOptions)
@@ -29,7 +29,7 @@ func Create(ctx context.Context, config entities.VolumeCreateOptions, options *C
 		return nil, err
 	}
 	stringReader := strings.NewReader(createString)
-	response, err := conn.DoRequest(stringReader, http.MethodPost, "/volumes/create", nil, nil)
+	response, err := conn.DoRequest(ctx, stringReader, http.MethodPost, "/volumes/create", nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -39,9 +39,9 @@ func Create(ctx context.Context, config entities.VolumeCreateOptions, options *C
 }
 
 // Inspect returns low-level information about a volume.
-func Inspect(ctx context.Context, nameOrID string, options *InspectOptions) (*entities.VolumeConfigResponse, error) {
+func Inspect(ctx context.Context, nameOrID string, options *InspectOptions) (*entitiesTypes.VolumeConfigResponse, error) {
 	var (
-		inspect entities.VolumeConfigResponse
+		inspect entitiesTypes.VolumeConfigResponse
 	)
 	if options == nil {
 		options = new(InspectOptions)
@@ -51,7 +51,7 @@ func Inspect(ctx context.Context, nameOrID string, options *InspectOptions) (*en
 	if err != nil {
 		return nil, err
 	}
-	response, err := conn.DoRequest(nil, http.MethodGet, "/volumes/%s/json", nil, nil, nameOrID)
+	response, err := conn.DoRequest(ctx, nil, http.MethodGet, "/volumes/%s/json", nil, nil, nameOrID)
 	if err != nil {
 		return &inspect, err
 	}
@@ -62,9 +62,9 @@ func Inspect(ctx context.Context, nameOrID string, options *InspectOptions) (*en
 
 // List returns the configurations for existing volumes in the form of a slice.  Optionally, filters
 // can be used to refine the list of volumes.
-func List(ctx context.Context, options *ListOptions) ([]*entities.VolumeListReport, error) {
+func List(ctx context.Context, options *ListOptions) ([]*entitiesTypes.VolumeListReport, error) {
 	var (
-		vols []*entities.VolumeListReport
+		vols []*entitiesTypes.VolumeListReport
 	)
 	conn, err := bindings.GetClient(ctx)
 	if err != nil {
@@ -74,7 +74,7 @@ func List(ctx context.Context, options *ListOptions) ([]*entities.VolumeListRepo
 	if err != nil {
 		return nil, err
 	}
-	response, err := conn.DoRequest(nil, http.MethodGet, "/volumes/json", params, nil)
+	response, err := conn.DoRequest(ctx, nil, http.MethodGet, "/volumes/json", params, nil)
 	if err != nil {
 		return vols, err
 	}
@@ -96,7 +96,7 @@ func Prune(ctx context.Context, options *PruneOptions) ([]*reports.PruneReport, 
 	if err != nil {
 		return nil, err
 	}
-	response, err := conn.DoRequest(nil, http.MethodPost, "/volumes/prune", params, nil)
+	response, err := conn.DoRequest(ctx, nil, http.MethodPost, "/volumes/prune", params, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -116,7 +116,7 @@ func Remove(ctx context.Context, nameOrID string, options *RemoveOptions) error 
 	if err != nil {
 		return err
 	}
-	response, err := conn.DoRequest(nil, http.MethodDelete, "/volumes/%s", params, nil, nameOrID)
+	response, err := conn.DoRequest(ctx, nil, http.MethodDelete, "/volumes/%s", params, nil, nameOrID)
 	if err != nil {
 		return err
 	}
@@ -131,7 +131,7 @@ func Exists(ctx context.Context, nameOrID string, options *ExistsOptions) (bool,
 	if err != nil {
 		return false, err
 	}
-	response, err := conn.DoRequest(nil, http.MethodGet, "/volumes/%s/exists", nil, nil, nameOrID)
+	response, err := conn.DoRequest(ctx, nil, http.MethodGet, "/volumes/%s/exists", nil, nil, nameOrID)
 	if err != nil {
 		return false, err
 	}
